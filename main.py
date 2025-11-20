@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException
 from dotenv import load_dotenv
 import os
 import requests
+from routes.test_alpaca import router as test_alpaca_router
 
 # 1) Cargar variables del .env
 load_dotenv()
@@ -16,6 +17,7 @@ if APCA_API_KEY_ID is None or APCA_API_SECRET_KEY is None:
 print("DBG: KEY", APCA_API_KEY_ID[:4], "DATA_URL:", APCA_DATA_URL)
 
 app = FastAPI()
+app.include_router(test_alpaca_router)
 
 
 def get_latest_trade(symbol: str):
@@ -57,3 +59,4 @@ def market_snapshot():
             status_code=500,
             detail=f"Unexpected error: {e}"
         )
+
