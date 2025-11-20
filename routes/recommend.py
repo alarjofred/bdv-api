@@ -1,104 +1,57 @@
 from fastapi import APIRouter
-from dotenv import load_dotenv
-import os
 import requests
+import os
 
 router = APIRouter()
 
-# Cargar variables de entorno (las mismas que usa main.py)
-load_dotenv()
-
-APCA_API_KEY_ID = os.getenv("APCA_API_KEY_ID")
-APCA_API_SECRET_KEY = os.getenv("APCA_API_SECRET_KEY")
-APCA_DATA_URL = os.getenv("APCA_DATA_URL", "https://data.alpaca.markets/v2")
-
-
-def alpaca_headers():
-    return {
-        "APCA-API-KEY-ID": APCA_API_KEY_ID,
-        "APCA-API-SECRET-KEY": APCA_API_SECRET_KEY,
-    }
-
-
-def get_daily_change(symbol: str):
-    """
-    Usa barras diarias para calcular el cambio % entre el último close
-    y el close anterior.
-    """
-    url = f"{APCA_DATA_URL}/stocks/{symbol}/bars"
-    params = {"timeframe": "1Day", "limit": 2}
-    r = requests.get(url, headers=alpaca_headers(), params=params)
-    r.raise_for_status()
-    data = r.json()
-    bars = data.get("bars", [])
-    if len(bars) < 2:
-        return None
-
-    prev_close = bars[-2]["c"]
-    last_close = bars[-1]["c"]
-    change_pct = (last_close - prev_close) / prev_close * 100
-
-    return {
-        "symbol": symbol,
-        "prev_close": prev_close,
-        "last_close": last_close,
-        "change_pct": change_pct,
-    }
-
+# URL base del propio servidor
+API_BASE = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 
 @router.get("/recommend")
-def recommend():
-    """
-    Genera una recomendación básica para QQQ, SPY y NVDA:
-    - bullish  -> prefer_call
-    - bearish  -> prefer_put
-    - neutral  -> wait
-    """
-    symbols = ["QQQ", "SPY", "NVDA"]
-    recommendations = []
+def recommend_trade():
+    """Genera recomendaciones usando datos del endpoint /snapshot."""
 
-    for sym in symbols:
-        try:
-            info = get_daily_change(sym)
-            if not info:
-                recommendations.append(
-                {
-                    "symbol": sym,
-                    "status": "no_data",
-                }
-                )
+    try:
+        # 1. Obtener snapshot interno
+        snapshot_url = f"{API_BASE}/snapshot"
+        snapshot = requests.get(snapshot_url).json()
+
+        recommendations = []
+
+        for symbol, info in snapshot.items():
+            price = info["price"]
+
+            # Lógica ultra simple basada en movimiento intradía
+            if "price" not in info:
                 continue
 
-            change = info["change_pct"]
-            if change > 0.8:
-                bias = "bullish"
-                suggestion = "prefer_call"
-            elif change < -0.8:
-                bias = "bearish"
-                suggestion = "prefer_put"
+            # Ejemplo de sesgo básico
+            if price > info["price"] * 0.999:
+                recommendation = "BUY CALL"
+                target = round(price * 1.01, 2)
+                stop = round(price * 0.99, 2)
+            elif price < info["price"] * 1.001:
+                recommendation = "BUY PUT"
+                target = round(price * 0.99, 2)
+                stop = round(price * 1.01, 2)
             else:
-                bias = "neutral"
-                suggestion = "wait"
+                recommendation = "HOLD"
+                target = price
+                stop = price
 
-            recommendations.append(
-                {
-                    "symbol": sym,
-                    "change_pct": round(change, 2),
-                    "bias": bias,
-                    "suggestion": suggestion,
-                }
-            )
-        except Exception as e:
-            recommendations.append(
-                {
-                    "symbol": sym,
-                    "status": "error",
-                    "reason": str(e),
-                }
-            )
+            recommendations.append({
+                "symbol": symbol,
+                "price": price,
+                "recommendation": recommendation,
+                "target": target,
+                "stop": stop
+            })
 
-    return {
-        "status": "ok",
-        "recommendations": recommendations,
-        "note": "Lógica básica; el GPT BDV debe combinar esto con contexto intradía y gestión de riesgo.",
-    }
+        return {
+            "status": "ok",
+            "recommendations": recommendations,
+            "note": "Basado en snapshot. Lógica simple; el GPT BDV aplicará análisis avanzado."
+        }
+
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
