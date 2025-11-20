@@ -7,6 +7,7 @@ import requests
 from datetime import datetime
 
 from routes.test_alpaca import router as test_alpaca_router
+from routes.recommend import router as recommend_router
 
 # 1) Cargar variables del .env
 load_dotenv()
@@ -25,6 +26,7 @@ app = FastAPI(title="BDV Opciones API", version="1.0.0")
 
 # Incluir ruta de /test-alpaca
 app.include_router(test_alpaca_router)
+app.include_router(recommend_router)
 
 
 # ---------- Helpers Alpaca ----------
@@ -279,3 +281,4 @@ def get_trades_log(limit: int = 50):
 @app.get("/health")
 def health_check():
     return {"status": "ok"}
+
