@@ -1,48 +1,50 @@
 from fastapi import APIRouter
-import requests
 import os
+import requests
 
 router = APIRouter()
 
-# URL base del propio servidor
+# URL base de tu propia API en Render
 API_BASE = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 
 @router.get("/recommend")
 def recommend_trade():
-    """Genera recomendaciones usando datos del endpoint /snapshot."""
-
+    """
+    Genera recomendaciones simples usando los datos del endpoint /snapshot.
+    """
     try:
-        # 1. Obtener snapshot interno
+        # 1) Llamar al endpoint /snapshot de esta misma API
         snapshot_url = f"{API_BASE}/snapshot"
-        snapshot = requests.get(snapshot_url).json()
+        resp = requests.get(snapshot_url)
+        resp.raise_for_status()
+        snapshot = resp.json()
+
+        # snapshot debería tener forma: {"status": "ok", "data": {...}}
+        market = snapshot.get("data", {})
+        if not market:
+            return {
+                "status": "error",
+                "message": "Respuesta de /snapshot no tiene campo 'data'"
+            }
 
         recommendations = []
 
-        for symbol, info in snapshot.items():
-            price = info["price"]
-
-            # Lógica ultra simple basada en movimiento intradía
-            if "price" not in info:
+        for symbol, info in market.items():
+            price = info.get("price")
+            if price is None:
                 continue
 
-            # Ejemplo de sesgo básico
-            if price > info["price"] * 0.999:
-                recommendation = "BUY CALL"
-                target = round(price * 1.01, 2)
-                stop = round(price * 0.99, 2)
-            elif price < info["price"] * 1.001:
-                recommendation = "BUY PUT"
-                target = round(price * 0.99, 2)
-                stop = round(price * 1.01, 2)
-            else:
-                recommendation = "HOLD"
-                target = price
-                stop = price
+            # Lógica muy básica: por ahora todo neutral
+            bias = "neutral"
+            suggestion = "wait"
+            target = price
+            stop = price
 
             recommendations.append({
                 "symbol": symbol,
                 "price": price,
-                "recommendation": recommendation,
+                "bias": bias,
+                "suggestion": suggestion,
                 "target": target,
                 "stop": stop
             })
@@ -50,7 +52,7 @@ def recommend_trade():
         return {
             "status": "ok",
             "recommendations": recommendations,
-            "note": "Basado en snapshot. Lógica simple; el GPT BDV aplicará análisis avanzado."
+            "note": "Basado en /snapshot. Lógica simple; el GPT BDV aplica análisis y gestión de riesgo."
         }
 
     except Exception as e:
