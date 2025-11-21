@@ -1,22 +1,21 @@
 from fastapi import FastAPI, HTTPException
 from dotenv import load_dotenv
 from pydantic import BaseModel
+from typing import Optional, Literal
 import os
 import json
 import requests
 from datetime import datetime
 
-# ==========================
-# Routers externos (otros archivos)
-# ==========================
+# Routers existentes
 from routes.test_alpaca import router as test_alpaca_router
 from routes.recommend import router as recommend_router
 from routes.signals import router as signals_router
 from routes.config import router as config_router
 
-# ==========================
-# Cargar variables de entorno
-# ==========================
+# ---------------------------------
+# Cargar variables del entorno
+# ---------------------------------
 load_dotenv()
 
 APCA_API_KEY_ID = os.getenv("APCA_API_KEY_ID")
@@ -24,56 +23,61 @@ APCA_API_SECRET_KEY = os.getenv("APCA_API_SECRET_KEY")
 APCA_DATA_URL = os.getenv("APCA_DATA_URL", "https://data.alpaca.markets/v2")
 APCA_TRADING_URL = os.getenv("APCA_TRADING_URL", "https://paper-api.alpaca.markets/v2")
 
-# Archivo donde guardamos el log de operaciones
-TRADE_LOG_FILE = "trades-log.jsonl"  # un JSON por línea
+TRADES_LOG_FILE = "trades-log.jsonl"
 
-if APCA_API_KEY_ID is None or APCA_API_SECRET_KEY is None:
-    raise RuntimeError("Faltan APCA_API_KEY_ID o APCA_API_SECRET_KEY en el .env")
+if not APCA_API_KEY_ID or not APCA_API_SECRET_KEY:
+    raise RuntimeError("Faltan APCA_API_KEY_ID o APCA_API_SECRET_KEY en el entorno (.env o secretos de Render)")
 
 
-def alpaca_headers():
-    """Headers estándar para llamar a la API de Alpaca."""
+def alpaca_headers() -> dict:
+    """Headers básicos para cualquier llamada a Alpaca."""
     return {
         "APCA-API-KEY-ID": APCA_API_KEY_ID,
         "APCA-API-SECRET-KEY": APCA_API_SECRET_KEY,
-        "Content-Type": "application/json",
+        "Accept": "application/json",
     }
 
 
-# ==========================
-# Crear app FastAPI
-# ==========================
+# ---------------------------------
+# Inicializar FastAPI
+# ---------------------------------
 app = FastAPI(title="BDV API", version="0.1.0")
 
-# Incluir routers de otros archivos
+# Incluir routers
 app.include_router(test_alpaca_router)
 app.include_router(recommend_router)
 app.include_router(signals_router)
 app.include_router(config_router)
 
 
-# ==========================
-# /snapshot  (último precio QQQ, SPY, NVDA)
-# ==========================
-def get_latest_trade(symbol: str):
-    """Consulta el último trade de un símbolo en Alpaca DATA v2."""
+# ---------------------------------
+# Función auxiliar: último trade
+# ---------------------------------
+def get_latest_trade(symbol: str) -> dict:
+    """Consulta el último trade de un símbolo en Alpaca (data API)."""
     url = f"{APCA_DATA_URL}/stocks/{symbol}/trades/latest"
-    r = requests.get(url, headers=alpaca_headers())
+    r = requests.get(url, headers=alpaca_headers(), timeout=10)
     print(f"[DBG] Alpaca latest trade {symbol}: {r.status_code} {r.text[:200]}")
     r.raise_for_status()
     return r.json()
 
 
+# ---------------------------------
+# Endpoint /snapshot
+# ---------------------------------
 @app.get("/snapshot")
 def market_snapshot():
-    """Devuelve último precio y hora de QQQ, SPY y NVDA."""
+    """
+    Devuelve último precio y hora de QQQ, SPY y NVDA.
+    """
     try:
         symbols = ["QQQ", "SPY", "NVDA"]
         data = {}
 
         for sym in symbols:
             raw = get_latest_trade(sym)
-            trade = raw.get("trade", {})
+            trade = raw.get("trade", {}) or raw.get("trades", [{}])[0]
+
             data[sym] = {
                 "price": trade.get("p"),
                 "time": trade.get("t"),
@@ -81,89 +85,129 @@ def market_snapshot():
 
         return {"status": "ok", "data": data}
     except Exception as e:
-        print("[ERR] /snapshot:", e)
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[ERR] /snapshot: {e}")
+        raise HTTPException(status_code=500, detail=f"Error getting snapshot: {e}")
 
 
-# ==========================
-# /trade  (ejecutar orden en Alpaca)
-# ==========================
+# ---------------------------------
+# Modelo para /trade
+# ---------------------------------
 class TradeRequest(BaseModel):
     symbol: str
-    side: str              # "buy" o "sell"
+    side: Literal["buy", "sell"]
     qty: int
-    type: str = "market"   # market / limit
-    time_in_force: str = "day"  # day / gtc / etc.
+    type: Literal["market", "limit"] = "market"
+    time_in_force: Literal["day", "gtc"] = "day"
+    limit_price: Optional[float] = None
 
 
-def log_trade(payload, response_json, error: str | None = None):
-    """Guarda en archivo cada operación enviada a Alpaca."""
-    entry = {
-        "ts": datetime.utcnow().isoformat(),
-        "payload": payload,
-        "response": response_json,
-        "error": error,
-    }
+# ---------------------------------
+# Log de trades en archivo local
+# ---------------------------------
+def append_trade_log(entry: dict) -> None:
+    """Guarda una línea JSON por trade en un archivo local."""
     try:
-        with open(TRADE_LOG_FILE, "a") as f:
-            f.write(json.dumps(entry) + "\n")
+        line = json.dumps(entry, ensure_ascii=False)
+        with open(TRADES_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
     except Exception as e:
-        print("[ERR] al escribir log:", e)
+        # No romper la API por fallo de log
+        print(f"[WARN] No se pudo escribir en el log de trades: {e}")
 
 
+# ---------------------------------
+# Endpoint /trade  (ejecutar orden en Alpaca)
+# ---------------------------------
 @app.post("/trade")
 def place_trade(req: TradeRequest):
-    """Envía una orden a Alpaca y la registra en el log."""
-    url = f"{APCA_TRADING_URL}/v2/orders"
+    """
+    Envía una orden a Alpaca y la registra en el log.
+    """
+    orders_url = f"{APCA_TRADING_URL}/orders"
 
     payload = {
         "symbol": req.symbol,
-        "side": req.side,
         "qty": req.qty,
+        "side": req.side,
         "type": req.type,
         "time_in_force": req.time_in_force,
     }
 
+    if req.type == "limit" and req.limit_price is not None:
+        payload["limit_price"] = req.limit_price
+
     try:
-        r = requests.post(url, headers=alpaca_headers(), data=json.dumps(payload))
-        print(f"[DBG] /trade {req.symbol}: {r.status_code} {r.text[:200]}")
+        print(f"[DBG] Enviando orden Alpaca: {payload}")
+        r = requests.post(orders_url, headers=alpaca_headers(), json=payload, timeout=10)
+        raw_text = r.text
+        print(f"[DBG] Respuesta Alpaca: {r.status_code} {raw_text[:300]}")
 
-        if not r.ok:
-            # Error HTTP de Alpaca
-            log_trade(payload, r.text, error="HTTP_ERROR")
-            raise HTTPException(status_code=r.status_code, detail=r.text)
+        try:
+            body = r.json()
+        except Exception:
+            body = {"raw": raw_text}
 
-        data = r.json()
-        log_trade(payload, data)
-        return {"status": "ok", "order": data}
+        status = "ok" if r.status_code < 400 else "error"
+
+        log_entry = {
+            "timestamp_utc": datetime.utcnow().isoformat(),
+            "symbol": req.symbol,
+            "side": req.side,
+            "qty": req.qty,
+            "type": req.type,
+            "time_in_force": req.time_in_force,
+            "status": status,
+            "http_status": r.status_code,
+            "alpaca_response": body,
+        }
+        append_trade_log(log_entry)
+
+        if status == "error":
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "message": "Error placing order in Alpaca",
+                    "alpaca_status": r.status_code,
+                    "alpaca_body": body,
+                },
+            )
+
+        return {"status": "ok", "order": body}
 
     except HTTPException:
-        # Re-lanzar para que FastAPI devuelva el status correcto
         raise
     except Exception as e:
-        # Cualquier otra excepción
-        log_trade(payload, None, error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[ERR] /trade: {e}")
+        raise HTTPException(status_code=500, detail=f"Unexpected error placing trade: {e}")
 
 
-# ==========================
-# /trades-log  (ver historial de órdenes)
-# ==========================
+# ---------------------------------
+# Endpoint /trades-log  (leer log)
+# ---------------------------------
 @app.get("/trades-log")
-def get_trades_log(limit: int = 50):
-    """Devuelve las últimas operaciones registradas en el log."""
+def get_trades_log(limit: int = 10):
+    """
+    Devuelve las últimas operaciones registradas en el log local.
+    """
     try:
-        if not os.path.exists(TRADE_LOG_FILE):
+        if not os.path.exists(TRADES_LOG_FILE):
             return {"status": "ok", "log": []}
 
-        lines = []
-        with open(TRADE_LOG_FILE, "r") as f:
+        entries = []
+        with open(TRADES_LOG_FILE, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
-                if line:
-                    lines.append(json.loads(line))
+                if not line:
+                    continue
+                try:
+                    entries.append(json.loads(line))
+                except Exception:
+                    continue
 
         # Solo las últimas N
-        return {"status": "ok", "log": lines[-limit:]}
+        entries = entries[-limit:]
+        return {"status": "ok", "log": entries}
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[ERR] /trades-log: {e}")
+        raise HTTPException(status_code=500, detail=f"Error reading trades log: {e}")
