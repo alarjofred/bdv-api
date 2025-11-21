@@ -211,3 +211,4 @@ def get_trades_log(limit: int = 10):
     except Exception as e:
         print(f"[ERR] /trades-log: {e}")
         raise HTTPException(status_code=500, detail=f"Error reading trades log: {e}")
+
