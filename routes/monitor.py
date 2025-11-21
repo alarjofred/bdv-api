@@ -1,7 +1,7 @@
 # routes/monitor.py
 from fastapi import APIRouter
 from datetime import datetime
-from .config import config_state  # IMPORT RELATIVO (importante)
+from .config import config_state  # IMPORT RELATIVO
 
 router = APIRouter(prefix="/monitor", tags=["monitor"])
 
@@ -11,7 +11,6 @@ def monitor_tick():
     Endpoint llamado por cron jobs (Render) para revisar el estado
     y, más adelante, ejecutar lógica automática de trading.
     """
-
     return {
         "status": "checked",
         "message": "Monitor tick procesado correctamente.",
