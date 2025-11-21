@@ -85,6 +85,7 @@ app = FastAPI()
 # Incluir routers externos
 app.include_router(test_alpaca_router)
 app.include_router(recommend_router)
+app.include_router(config_router)
 
 
 # -----------------------------------------
@@ -178,3 +179,4 @@ def place_trade(req: TradeRequest):
 def get_trades_log(limit: int = 50):
     logs = read_trade_logs(limit)
     return {"count": len(logs), "items": logs}
+
