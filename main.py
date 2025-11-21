@@ -9,7 +9,8 @@ from datetime import datetime
 # Routers
 from routes.test_alpaca import router as test_alpaca_router
 from routes.recommend import router as recommend_router
-
+from routes.signals import router as signals_router
+from routes.config import router as config_router
 # -----------------------------------------
 # Cargar variables del entorno
 # -----------------------------------------
@@ -85,7 +86,9 @@ app = FastAPI()
 # Incluir routers externos
 app.include_router(test_alpaca_router)
 app.include_router(recommend_router)
+app.include_router(signals_router)
 app.include_router(config_router)
+
 
 
 # -----------------------------------------
@@ -179,4 +182,5 @@ def place_trade(req: TradeRequest):
 def get_trades_log(limit: int = 50):
     logs = read_trade_logs(limit)
     return {"count": len(logs), "items": logs}
+
 
