@@ -14,8 +14,6 @@ from routes.signals import router as signals_router
 from routes.config import router as config_router
 from routes.monitor import router as monitor_router
 
-app.include_router(monitor_router)
-
 # ---------------------------------
 # Cargar variables del entorno
 # ---------------------------------
@@ -214,6 +212,7 @@ def get_trades_log(limit: int = 10):
     except Exception as e:
         print(f"[ERR] /trades-log: {e}")
         raise HTTPException(status_code=500, detail=f"Error reading trades log: {e}")
+
 
 
 
