@@ -12,7 +12,10 @@ from routes.test_alpaca import router as test_alpaca_router
 from routes.recommend import router as recommend_router
 from routes.signals import router as signals_router
 from routes.config import router as config_router
-from routes import monitor as monitor_router
+from routes.monitor import router as monitor_router
+
+app.include_router(monitor_router)
+
 # ---------------------------------
 # Cargar variables del entorno
 # ---------------------------------
@@ -48,7 +51,7 @@ app.include_router(test_alpaca_router)
 app.include_router(recommend_router)
 app.include_router(signals_router)
 app.include_router(config_router)
-app.include_router(monitor_router.router)
+app.include_router(monitor_router)
 
 # ---------------------------------
 # Función auxiliar: último trade
@@ -211,5 +214,6 @@ def get_trades_log(limit: int = 10):
     except Exception as e:
         print(f"[ERR] /trades-log: {e}")
         raise HTTPException(status_code=500, detail=f"Error reading trades log: {e}")
+
 
 
