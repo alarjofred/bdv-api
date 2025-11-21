@@ -1,108 +1,84 @@
-from fastapi import APIRouter, HTTPException
-from typing import Literal
+# routes/config.py
+
+from enum import Enum
+from fastapi import APIRouter
 from pydantic import BaseModel
 
-router = APIRouter()
-
-# -------------------------------------------------------
-#  Estado en memoria (se reinicia si Render reinicia el servicio)
-# -------------------------------------------------------
-EXECUTION_MODE: Literal["manual", "auto"] = "manual"
-RISK_MODE: Literal["low", "medium", "high"] = "medium"
-MAX_TRADES_PER_DAY: int = 3
-TRADES_TODAY: int = 0  # por ahora sólo informativo
+router = APIRouter(prefix="/config", tags=["config"])
 
 
-# -------------------------------------------------------
-#  Modelos de respuesta (para que el OpenAPI quede limpio)
-# -------------------------------------------------------
-class ConfigStatusResponse(BaseModel):
-    execution_mode: Literal["manual", "auto"]
-    risk_mode: Literal["low", "medium", "high"]
-    max_trades_per_day: int
-    trades_today: int
+class ExecutionMode(str, Enum):
+    manual = "manual"
+    auto = "auto"
 
 
-class ExecutionModeResponse(BaseModel):
-    status: str
-    execution_mode: Literal["manual", "auto"]
-    message: str
+class RiskMode(str, Enum):
+    low = "low"
+    medium = "medium"
+    high = "high"
 
 
-class RiskModeResponse(BaseModel):
-    status: str
-    risk_mode: Literal["low", "medium", "high"]
-    max_trades_per_day: int
-    message: str
+class ConfigStatus(BaseModel):
+    execution_mode: ExecutionMode = ExecutionMode.manual
+    risk_mode: RiskMode = RiskMode.low
+    max_trades_per_day: int = 0
+    trades_today: int = 0
 
 
-# -------------------------------------------------------
-#  GET /config/status
-# -------------------------------------------------------
-@router.get("/config/status", response_model=ConfigStatusResponse)
+# 👉 ESTADO GLOBAL ÚNICO DE CONFIGURACIÓN
+config_state = ConfigStatus()
+
+
+def _update_max_trades():
+    """
+    Ajusta el número máximo de trades por día según el riesgo.
+    Puedes cambiar estos valores si quieres otra lógica.
+    """
+    if config_state.risk_mode == RiskMode.low:
+        config_state.max_trades_per_day = 1
+    elif config_state.risk_mode == RiskMode.medium:
+        config_state.max_trades_per_day = 3
+    elif config_state.risk_mode == RiskMode.high:
+        config_state.max_trades_per_day = 5
+
+
+@router.get("/status", response_model=ConfigStatus)
 def get_config_status():
     """
     Devuelve la configuración actual del sistema BDV API.
     """
-    return {
-        "execution_mode": EXECUTION_MODE,
-        "risk_mode": RISK_MODE,
-        "max_trades_per_day": MAX_TRADES_PER_DAY,
-        "trades_today": TRADES_TODAY,
-    }
+    return config_state
 
 
-# -------------------------------------------------------
-#  POST /config/execution-mode
-#  mode: "manual" | "auto"
-# -------------------------------------------------------
-@router.post("/config/execution-mode", response_model=ExecutionModeResponse)
-def set_execution_mode(mode: Literal["manual", "auto"]):
+@router.post("/execution-mode", response_model=ConfigStatus)
+def set_execution_mode(mode: ExecutionMode):
     """
-    Cambia el modo de ejecución:
-      - manual: sólo señales, tú confirmas.
-      - auto: la API puede enviar órdenes a Alpaca (según reglas).
+    Cambia el modo de ejecución del bot:
+    - manual: solo señales, tú confirmas.
+    - auto: la API puede enviar órdenes a Alpaca (según reglas).
     """
-    global EXECUTION_MODE
-
-    if mode not in ("manual", "auto"):
-        raise HTTPException(status_code=422, detail="Invalid execution mode")
-
-    EXECUTION_MODE = mode
-
-    return {
-        "status": "ok",
-        "execution_mode": EXECUTION_MODE,
-        "message": f"Modo de ejecución cambiado a '{EXECUTION_MODE}'",
-    }
+    config_state.execution_mode = mode
+    # No cambia límites de trades; solo el modo
+    return config_state
 
 
-# -------------------------------------------------------
-#  POST /config/risk-mode
-#  mode: "low" | "medium" | "high"
-# -------------------------------------------------------
-@router.post("/config/risk-mode", response_model=RiskModeResponse)
-def set_risk_mode(mode: Literal["low", "medium", "high"]):
+@router.post("/risk-mode", response_model=ConfigStatus)
+def set_risk_mode(mode: RiskMode):
     """
-    Cambia el modo de riesgo y ajusta el número máximo
-    de trades por día.
+    Cambia el nivel de riesgo del bot:
+    - low, medium, high
+    y ajusta el máximo de trades por día.
     """
-    global RISK_MODE, MAX_TRADES_PER_DAY
+    config_state.risk_mode = mode
+    _update_max_trades()
+    return config_state
 
-    if mode == "low":
-        MAX_TRADES_PER_DAY = 2
-    elif mode == "medium":
-        MAX_TRADES_PER_DAY = 3
-    elif mode == "high":
-        MAX_TRADES_PER_DAY = 5
-    else:
-        raise HTTPException(status_code=422, detail="Invalid risk mode")
 
-    RISK_MODE = mode
-
-    return {
-        "status": "ok",
-        "risk_mode": RISK_MODE,
-        "max_trades_per_day": MAX_TRADES_PER_DAY,
-        "message": f"Modo de riesgo cambiado a '{RISK_MODE}'",
-    }
+@router.post("/reset-trades", response_model=ConfigStatus)
+def reset_trades_today():
+    """
+    Resetea el contador de trades ejecutados hoy.
+    (Útil para pruebas o al inicio de sesión).
+    """
+    config_state.trades_today = 0
+    return config_state
