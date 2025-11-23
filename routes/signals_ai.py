@@ -4,6 +4,14 @@ from typing import Optional, Literal, List
 
 from fastapi import APIRouter, Query
 from pydantic import BaseModel, Field
+safe_structure = {
+    "kind": "none",
+    "direction": "none",
+    "legs": [],
+    "days_to_expiry": 0,
+    "delta_hint": "none"
+}
+
 
 router = APIRouter(prefix="/signals", tags=["signals_ai"])
 
@@ -347,7 +355,8 @@ def _build_trend_call_debit_spread(symbol: str) -> OptionSignal:
         time_frame="5m",
         bias=Bias.bullish,
         confidence=0.75,
-        structure=OptionStructure(
+        "structure": safe_structure,
+
             kind=StructureKind.debit_spread,
             direction=Direction.call,
             legs=[
@@ -380,7 +389,8 @@ def _build_trend_put_debit_spread(symbol: str) -> OptionSignal:
         time_frame="5m",
         bias=Bias.bearish,
         confidence=0.75,
-        structure=OptionStructure(
+        "structure": safe_structure,
+
             kind=StructureKind.debit_spread,
             direction=Direction.put,
             legs=[
@@ -412,7 +422,8 @@ def _build_bull_put_credit_spread(symbol: str) -> OptionSignal:
         time_frame="5m",
         bias=Bias.bullish,
         confidence=0.7,
-        structure=OptionStructure(
+        "structure": safe_structure,
+
             kind=StructureKind.credit_spread,
             direction=Direction.put,
             legs=[
@@ -444,7 +455,8 @@ def _build_bear_call_credit_spread(symbol: str) -> OptionSignal:
         time_frame="5m",
         bias=Bias.bearish,
         confidence=0.7,
-        structure=OptionStructure(
+        "structure": safe_structure,
+
             kind=StructureKind.credit_spread,
             direction=Direction.call,
             legs=[
@@ -476,7 +488,8 @@ def _build_no_trade(symbol: str, bias: Bias) -> OptionSignal:
         time_frame="5m",
         bias=bias,
         confidence=0.0,
-        structure=OptionStructure(
+        "structure": safe_structure,
+
             kind=StructureKind.none,
             direction=Direction.none,
             legs=[],
@@ -557,7 +570,8 @@ def generate_ai_signal(
             time_frame="5m",
             bias=bias,
             confidence=confidence,
-            structure=OptionStructure(
+            "structure": safe_structure,
+
                 kind=kind,
                 direction=direction,
                 legs=legs,
