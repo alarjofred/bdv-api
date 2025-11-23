@@ -13,6 +13,7 @@ from routes.recommend import router as recommend_router
 from routes.signals import router as signals_router
 from routes.config import router as config_router
 from routes.monitor import router as monitor_router
+from routes.signals_ai import router as signals_ai_router
 
 # ---------------------------------
 # Cargar variables del entorno
@@ -50,6 +51,7 @@ app.include_router(recommend_router)
 app.include_router(signals_router)
 app.include_router(config_router)
 app.include_router(monitor_router)
+app.include_router(signals_ai_router)
 
 # ---------------------------------
 # Función auxiliar: último trade
@@ -212,6 +214,7 @@ def get_trades_log(limit: int = 10):
     except Exception as e:
         print(f"[ERR] /trades-log: {e}")
         raise HTTPException(status_code=500, detail=f"Error reading trades log: {e}")
+
 
 
 
