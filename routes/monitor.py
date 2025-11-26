@@ -37,8 +37,8 @@ def get_alpaca_client() -> REST:
 # PARÁMETROS DE GESTIÓN BDV
 # ==========================
 
-TP_PCT = 0.10    # 10% de ganancia (0.10 = 10 %)
-SL_PCT = -0.03   # -3% de pérdida
+TP_PCT = 0.12    # 12% de ganancia (0.12 = 12 %)
+SL_PCT = -0.05   # -5% de pérdida
 MAX_RUNNERS = 1  # máximo 1 posición "runner" para el día siguiente
 
 
