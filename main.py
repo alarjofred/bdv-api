@@ -7,17 +7,6 @@ import json
 import requests
 from datetime import datetime
 
-# Routers existentes
-from routes.test_alpaca import router as test_alpaca_router
-from routes.recommend import router as recommend_router
-from routes.signals import router as signals_router
-from routes.config import router as config_router
-from routes.monitor import router as monitor_router
-from routes.signals_ai import router as signals_ai_router
-from routes.alpaca_close import router as alpaca_close_router  # 👈 NUEVO, IMPORTANTE
-
-
-
 # ---------------------------------
 # Cargar variables del entorno
 # ---------------------------------
@@ -43,6 +32,18 @@ def alpaca_headers() -> dict:
     }
 
 # ---------------------------------
+# IMPORT DE ROUTERS
+# ---------------------------------
+
+from routes.test_alpaca import router as test_alpaca_router
+from routes.recommend import router as recommend_router
+from routes.signals import router as signals_router
+from routes.config import router as config_router
+from routes.monitor import router as monitor_router
+from routes.signals_ai import router as signals_ai_router
+from routes.alpaca_close import router as alpaca_close_router  # 👈 IMPORTANTE
+
+# ---------------------------------
 # Inicializar FastAPI
 # ---------------------------------
 app = FastAPI(title="BDV API", version="0.1.0")
@@ -54,7 +55,7 @@ app.include_router(signals_router)
 app.include_router(config_router)
 app.include_router(monitor_router)
 app.include_router(signals_ai_router)
-app.include_router(alpaca_close_router)  # 👈 aquí usamos el alias del import
+app.include_router(alpaca_close_router)  # 👈 AQUÍ SE MONTA EL NUEVO
 
 # ---------------------------------
 # Función auxiliar: último trade
@@ -217,13 +218,3 @@ def get_trades_log(limit: int = 10):
     except Exception as e:
         print(f"[ERR] /trades-log: {e}")
         raise HTTPException(status_code=500, detail=f"Error reading trades log: {e}")
-
-
-
-
-
-
-
-
-
-
