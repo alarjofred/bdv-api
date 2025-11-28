@@ -2,10 +2,14 @@ from fastapi import APIRouter, HTTPException
 import os
 import requests
 
+# Router específico para operaciones de cierre con Alpaca
 router = APIRouter(prefix="/alpaca", tags=["alpaca"])
 
 
-def get_alpaca_headers():
+def get_alpaca_headers() -> dict:
+    """
+    Devuelve los headers necesarios para autenticar contra Alpaca.
+    """
     api_key = os.getenv("APCA_API_KEY_ID")
     api_secret = os.getenv("APCA_API_SECRET_KEY")
 
@@ -18,6 +22,7 @@ def get_alpaca_headers():
     return {
         "APCA-API-KEY-ID": api_key,
         "APCA-API-SECRET-KEY": api_secret,
+        "Accept": "application/json",
     }
 
 
@@ -25,61 +30,72 @@ def get_alpaca_headers():
 def close_all_positions():
     """
     Cierra TODAS las posiciones abiertas en Alpaca al mejor precio disponible.
-    Úsalo SOLO cuando quieras salir completamente del mercado.
+    Úsalo solo cuando quieras salir completamente del mercado.
     """
-    TRADING_URL = os.getenv("APCA_TRADING_URL", "https://paper-api.alpaca.markets/v2")
-url = f"{TRADING_URL}/positions"
-
-    headers = get_alpaca_headers()
+    trading_url = os.getenv(
+        "APCA_TRADING_URL",
+        "https://paper-api.alpaca.markets/v2",
+    )
+    url = f"{trading_url}/positions"
 
     try:
-        resp = requests.delete(url, headers=headers)
+        r = requests.delete(url, headers=get_alpaca_headers(), timeout=10)
+        body = r.json() if r.text else {}
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Error de conexión con Alpaca: {e}",
+            detail=f"Error llamando a Alpaca: {e}",
         )
 
-    if resp.status_code not in (200, 207, 204):
-        # 207 = multi-status cuando cierra varias
+    if r.status_code >= 400:
         raise HTTPException(
-            status_code=resp.status_code,
-            detail=f"Error al cerrar posiciones en Alpaca: {resp.text}",
+            status_code=502,
+            detail={
+                "message": "Error cerrando posiciones en Alpaca",
+                "alpaca_status": r.status_code,
+                "alpaca_body": body,
+            },
         )
 
-    return {
-        "status": "ok",
-        "message": "Se enviaron las órdenes para cerrar todas las posiciones en Alpaca.",
-        "alpaca_response": resp.json() if resp.text else None,
-    }
+    return {"status": "ok", "closed": body}
 
 
 @router.post("/close/{symbol}")
-def close_symbol_position(symbol: str):
+def close_symbol(symbol: str):
     """
-    Cierra SOLO la posición de un símbolo específico (ej. QQQ, SPY, NVDA).
+    Cierra la posición abierta en un símbolo específico (si existe).
+    Ejemplo: POST /alpaca/close/QQQ
     """
-    base_url = os.getenv("ALPACA_BASE_URL", "https://api.alpaca.markets")
-    url = f"{base_url}/v2/positions/{symbol.upper()}"
-
-    headers = get_alpaca_headers()
+    trading_url = os.getenv(
+        "APCA_TRADING_URL",
+        "https://paper-api.alpaca.markets/v2",
+    )
+    url = f"{trading_url}/positions/{symbol.upper()}"
 
     try:
-        resp = requests.delete(url, headers=headers)
+        r = requests.delete(url, headers=get_alpaca_headers(), timeout=10)
+        body = r.json() if r.text else {}
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Error de conexión con Alpaca: {e}",
+            detail=f"Error llamando a Alpaca: {e}",
         )
 
-    if resp.status_code not in (200, 204):
+    if r.status_code == 404:
+        # No hay posición para ese símbolo
         raise HTTPException(
-            status_code=resp.status_code,
-            detail=f"Error al cerrar posición de {symbol}: {resp.text}",
+            status_code=404,
+            detail=f"No hay posición abierta en {symbol.upper()}",
         )
 
-    return {
-        "status": "ok",
-        "message": f"Se envió la orden para cerrar la posición de {symbol.upper()} en Alpaca.",
-        "alpaca_response": resp.json() if resp.text else None,
-    }
+    if r.status_code >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "Error cerrando posición en Alpaca",
+                "alpaca_status": r.status_code,
+                "alpaca_body": body,
+            },
+        )
+
+    return {"status": "ok", "closed": body}
