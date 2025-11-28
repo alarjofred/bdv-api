@@ -1,9 +1,11 @@
-fastapi
 uvicorn[standard]
 httpx
 python-dotenv
 requests
 pytz
+alpaca-trade-api
+
+
 
 
 
