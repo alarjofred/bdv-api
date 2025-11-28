@@ -21,7 +21,7 @@ class ConfigStatus(BaseModel):
 
 # ESTADO GLOBAL ÚNICO
 config_state = ConfigStatus()
-_update_max_trades()
+# _update_max_trades()  # 👈 COMENTAR ESTA LÍNEA
 
 def _update_max_trades():
     if config_state.risk_mode == RiskMode.low:
