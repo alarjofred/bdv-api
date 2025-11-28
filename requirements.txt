@@ -3,5 +3,7 @@ uvicorn[standard]
 httpx
 python-dotenv
 requests
+pytz
+
 
 
