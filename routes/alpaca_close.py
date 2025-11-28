@@ -27,8 +27,8 @@ def close_all_positions():
     Cierra TODAS las posiciones abiertas en Alpaca al mejor precio disponible.
     Úsalo SOLO cuando quieras salir completamente del mercado.
     """
-    base_url = os.getenv("ALPACA_BASE_URL", "https://api.alpaca.markets")
-    url = f"{base_url}/v2/positions"
+    TRADING_URL = os.getenv("APCA_TRADING_URL", "https://paper-api.alpaca.markets/v2")
+url = f"{TRADING_URL}/positions"
 
     headers = get_alpaca_headers()
 
