@@ -1,213 +1,299 @@
-from fastapi import APIRouter
-import datetime
+from fastapi import APIRouter, HTTPException
 import os
-from typing import List
-
-import pytz
-
-# Si usas alpaca_trade_api:
-#   pip install alpaca-trade-api
-# y descomenta esta línea:
-from alpaca_trade_api import REST
-
+import requests
+from datetime import datetime, timedelta, timezone
+from typing import Dict, Any, List
 
 router = APIRouter(prefix="/monitor", tags=["monitor"])
 
-# ============================================
-# CONFIGURACIÓN ALPACA – AJUSTA A TU PROYECTO
-# ============================================
+# URL pública de tu API (Render)
+API_BASE = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 
-ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
-ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
-ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+# URL de trading de Alpaca (paper/live)
+TRADING_URL = os.getenv("APCA_TRADING_URL", "https://paper-api.alpaca.markets").rstrip("/")
 
 
-def get_alpaca_client() -> REST:
+def get_alpaca_headers() -> Dict[str, str]:
     """
-    Devuelve el cliente de Alpaca.
-    Si en tu proyecto ya tienes otra función/objeto para esto,
-    puedes reemplazar esta función por la tuya.
+    Construye los headers necesarios para autenticar contra Alpaca.
     """
-    if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
-        raise RuntimeError("[BDV][Monitor] Faltan llaves de Alpaca en variables de entorno.")
-    return REST(ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL)
+    api_key = os.getenv("APCA_API_KEY_ID")
+    api_secret = os.getenv("APCA_API_SECRET_KEY")
+
+    if not api_key or not api_secret:
+        raise HTTPException(
+            status_code=500,
+            detail="Faltan las variables de entorno APCA_API_KEY_ID o APCA_API_SECRET_KEY",
+        )
+
+    return {
+        "APCA-API-KEY-ID": api_key,
+        "APCA-API-SECRET-KEY": api_secret,
+        "Accept": "application/json",
+    }
 
 
-# ==========================
-# PARÁMETROS DE GESTIÓN BDV
-# ==========================
-
-TP_PCT = 0.12    # 12% de ganancia (0.12 = 12 %)
-SL_PCT = -0.05   # -5% de pérdida
-MAX_RUNNERS = 1  # máximo 1 posición "runner" para el día siguiente
-
-
-# ==========================
-# FUNCIONES AUXILIARES TIEMPO
-# ==========================
-
-def _get_ny_time() -> datetime.datetime:
-    """Hora actual en Nueva York (para saber cierre de mercado)."""
-    tz = pytz.timezone("America/New_York")
-    return datetime.datetime.now(tz)
-
-
-def _is_near_market_close(minutes: int = 10) -> bool:
+def get_config_status() -> Dict[str, Any]:
     """
-    Devuelve True si estamos cerca del cierre de mercado (X minutos).
-    Se asume horario regular 9:30–16:00 NY.
+    Lee /config/status desde tu propia API para saber execution_mode y risk_mode.
+    Si falla, devuelve un dict vacío.
     """
-    now = _get_ny_time()
-    market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
-    delta = market_close - now
-    return datetime.timedelta(minutes=0) < delta <= datetime.timedelta(minutes=minutes)
-
-
-# ==========================
-# GESTIÓN DE POSICIONES BDV
-# ==========================
-
-def manage_open_positions(alpaca_client: REST) -> None:
-    """
-    Lógica de gestión de posiciones:
-    - TP en 10 %
-    - SL en -3 %
-    - Cerca del cierre:
-        - cerrar casi todo
-        - dejar a lo sumo 1 runner (mejor PnL >= 10 %)
-    """
+    if not API_BASE:
+        return {}
 
     try:
-        positions = alpaca_client.list_positions()
-    except Exception as e:
-        print(f"[BDV][Monitor] Error al listar posiciones: {e}")
-        return
+        resp = requests.get(f"{API_BASE}/config/status", timeout=5)
+        data = resp.json()
+        # Puede venir envuelto en {"data": {...}} o directo.
+        return data.get("data", data)
+    except Exception:
+        return {}
 
-    if not positions:
-        return
 
-    # 1) TP / SL INTRADÍA
-    for pos in positions:
-        try:
-            symbol = pos.symbol
-            # unrealized_plpc suele ser string "0.1234" => 12.34 %
-            pnl_pct = float(pos.unrealized_plpc)  # proporción, no en %
-        except Exception as e:
-            print(f"[BDV][Monitor] Error leyendo posición: {e}")
-            continue
+def get_account_and_positions() -> (Dict[str, Any], List[Dict[str, Any]]):
+    """
+    Obtiene la cuenta y las posiciones actuales en Alpaca.
+    """
+    headers = get_alpaca_headers()
 
-        # Take Profit (TP)
-        if pnl_pct >= TP_PCT:
-            print(f"[BDV][TP] Cerrando {symbol} por TP {pnl_pct:.2%}")
-            try:
-                alpaca_client.close_position(symbol)
-            except Exception as e:
-                print(f"[BDV][TP] Error al cerrar {symbol}: {e}")
-            continue
+    # Cuenta
+    acc_resp = requests.get(f"{TRADING_URL}/v2/account", headers=headers, timeout=5)
+    if acc_resp.status_code != 200:
+        raise HTTPException(
+            status_code=acc_resp.status_code,
+            detail=f"Error al leer cuenta: {acc_resp.text}",
+        )
+    account = acc_resp.json()
 
-        # Stop Loss (SL)
-        if pnl_pct <= SL_PCT:
-            print(f"[BDV][SL] Cerrando {symbol} por SL {pnl_pct:.2%}")
-            try:
-                alpaca_client.close_position(symbol)
-            except Exception as e:
-                print(f"[BDV][SL] Error al cerrar {symbol}: {e}")
+    # Posiciones
+    pos_resp = requests.get(f"{TRADING_URL}/v2/positions", headers=headers, timeout=5)
+    if pos_resp.status_code not in (200, 404):
+        raise HTTPException(
+            status_code=pos_resp.status_code,
+            detail=f"Error al leer posiciones: {pos_resp.text}",
+        )
 
-    # Releer posiciones después de TP/SL
+    if pos_resp.status_code == 404:
+        positions: List[Dict[str, Any]] = []
+    else:
+        positions = pos_resp.json()
+
+    return account, positions
+
+
+def get_risk_params(risk_mode: str) -> Dict[str, float]:
+    """
+    Define parámetros de riesgo por modo:
+    - tp_per_trade: take profit por trade (en fracción, 0.20 = 20%)
+    - sl_per_trade: stop loss por trade
+    - daily_target: meta diaria (fracción de la equity)
+    - daily_max_loss: pérdida máxima diaria (fracción de la equity)
+    """
+    risk_mode = (risk_mode or "low").lower()
+
+    if risk_mode == "high":
+        return {
+            "tp_per_trade": 0.30,
+            "sl_per_trade": 0.15,
+            "daily_target": 0.05,
+            "daily_max_loss": 0.02,
+        }
+    if risk_mode == "medium":
+        return {
+            "tp_per_trade": 0.20,
+            "sl_per_trade": 0.10,
+            "daily_target": 0.03,
+            "daily_max_loss": 0.015,
+        }
+    # low por defecto
+    return {
+        "tp_per_trade": 0.15,
+        "sl_per_trade": 0.08,
+        "daily_target": 0.02,
+        "daily_max_loss": 0.01,
+    }
+
+
+def is_after_close_time() -> bool:
+    """
+    Devuelve True si la hora actual (aprox ET) es >= 15:45.
+    Aproximación: ET = UTC-5. Es suficiente para la lógica interna.
+    """
+    now_utc = datetime.now(timezone.utc)
+    now_et = now_utc + timedelta(hours=-5)
+    return (now_et.hour > 15) or (now_et.hour == 15 and now_et.minute >= 45)
+
+
+def close_all_via_api() -> Dict[str, Any]:
+    """
+    Llama a tu propio endpoint POST /alpaca/close-all.
+    """
+    if not API_BASE:
+        raise HTTPException(
+            status_code=500,
+            detail="No está definido RENDER_EXTERNAL_URL para llamar /alpaca/close-all",
+        )
+
+    resp = requests.post(f"{API_BASE}/alpaca/close-all", timeout=10)
+    if resp.status_code not in (200, 207):
+        raise HTTPException(
+            status_code=resp.status_code,
+            detail=f"Error en /alpaca/close-all: {resp.text}",
+        )
+    return resp.json()
+
+
+def close_symbol_via_api(symbol: str) -> Dict[str, Any]:
+    """
+    Llama a tu propio endpoint POST /alpaca/close/{symbol}.
+    """
+    if not API_BASE:
+        raise HTTPException(
+            status_code=500,
+            detail="No está definido RENDER_EXTERNAL_URL para llamar /alpaca/close/{symbol}",
+        )
+
+    resp = requests.post(f"{API_BASE}/alpaca/close/{symbol}", timeout=10)
+
+    # Si Alpaca dice que no hay posición, devolvemos el JSON igualmente.
     try:
-        positions = alpaca_client.list_positions()
-    except Exception as e:
-        print(f"[BDV][Monitor] Error al relistar posiciones: {e}")
-        return
+        return resp.json()
+    except Exception:
+        # Respuesta sin JSON
+        if resp.status_code in (200, 204):
+            return {"status": "ok", "symbol": symbol, "detail": "cerrado"}
+        raise HTTPException(
+            status_code=resp.status_code,
+            detail=f"Error en /alpaca/close/{symbol}: {resp.text}",
+        )
 
-    if not positions:
-        return
-
-    # 2) LÓGICA CERCA DEL CIERRE DE MERCADO
-    if not _is_near_market_close(minutes=10):
-        # Si NO estamos cerca del cierre, no hacemos nada extra
-        return
-
-    enriched = []
-    for pos in positions:
-        try:
-            pnl_pct = float(pos.unrealized_plpc)
-            enriched.append((pnl_pct, pos))
-        except Exception as e:
-            print(f"[BDV][Monitor] Error enriqueciendo posición: {e}")
-            continue
-
-    if not enriched:
-        return
-
-    # Ordenar de mayor PnL a menor
-    enriched.sort(key=lambda x: x[0], reverse=True)
-
-    runners_kept = 0
-    for idx, (pnl_pct, pos) in enumerate(enriched):
-        symbol = pos.symbol
-
-        # Regla simple de cierre al final del día:
-        # - Si tiene ≥ 10 % y aún no hemos alcanzado el límite de runners,
-        #   podemos dejar ESTA posición abierta como posible "runner".
-        # - TODO lo demás se cierra al cierre.
-        keep = False
-        if pnl_pct >= TP_PCT and runners_kept < MAX_RUNNERS:
-            keep = True
-            runners_kept += 1
-
-        if keep:
-            print(f"[BDV][Runner] Manteniendo {symbol} con ganancia {pnl_pct:.2%} para posible capitalización mañana.")
-            continue
-
-        # Cerrar el resto al cierre
-        print(f"[BDV][Close EOD] Cerrando {symbol} al cierre con PnL {pnl_pct:.2%}")
-        try:
-            alpaca_client.close_position(symbol)
-        except Exception as e:
-            print(f"[BDV][Close EOD] Error al cerrar {symbol}: {e}")
-
-
-# ==========================
-# ENDPOINT /monitor/tick
-# ==========================
 
 @router.get("/tick")
-async def monitor_tick():
+def monitor_tick():
     """
-    Tick del monitor BDV:
-    - Aquí podrías tener ya tu lógica actual de:
-      * revisar señales AI
-      * revisar configuración BDV
-      * etc.
+    Monitoriza posiciones abiertas y aplica la estrategia de salidas automáticas (Opción A):
 
-    - Al final, llama a manage_open_positions() para aplicar:
-      * TP 10 %
-      * SL -3 %
-      * cierre al final del día
-      * dejar máximo 1 runner
+    - Respeta execution_mode de /config/status (solo actúa en modo 'auto')
+    - Cierra TODO por:
+        * meta diaria alcanzada
+        * pérdida diaria máxima
+        * hora límite (15:45 ET)
+    - Cierra símbolos individuales por:
+        * take profit por trade
+        * stop loss por trade
+
+    Devuelve un resumen de las acciones ejecutadas en este 'tick'.
     """
-    # 1) Lógica previa del monitor (si tenías algo, puedes insertarlo aquí)
-    #    Ejemplo:
-    #    - verificar /config/status
-    #    - llamar a /signals/ai
-    #    - registrar logs
-    #    IMPORTANTE: si tenías código aquí, no lo borres, insértalo encima
-    #    de la parte de Alpaca.
+    # 1) Leer configuración
+    config = get_config_status()
+    exec_mode = str(config.get("execution_mode", "manual")).lower()
+    risk_mode = str(config.get("risk_mode", "low")).lower()
 
-    # 2) Gestión de posiciones con Alpaca
-    try:
-        alpaca_client = get_alpaca_client()
-    except Exception as e:
-        print(f"[BDV][Monitor] Error creando cliente Alpaca: {e}")
+    if exec_mode != "auto":
         return {
-            "status": "error",
-            "detail": "No se pudo crear el cliente de Alpaca. Revisa las llaves en variables de entorno."
+            "status": "skipped",
+            "reason": f"execution_mode='{exec_mode}' (no es 'auto')",
+            "config": {"execution_mode": exec_mode, "risk_mode": risk_mode},
         }
 
-    manage_open_positions(alpaca_client)
+    # 2) Leer cuenta y posiciones
+    account, positions = get_account_and_positions()
+    equity = float(account.get("equity", 0.0))
+    last_equity = float(account.get("last_equity", equity))
+    pnl_today = equity - last_equity  # P&L aproximado del día
+
+    params = get_risk_params(risk_mode)
+    daily_target_abs = equity * params["daily_target"]
+    daily_max_loss_abs = -equity * params["daily_max_loss"]
+
+    actions: Dict[str, Any] = {
+        "closed_all": False,
+        "closed_symbols": [],
+        "reason_all": None,
+        "per_trade_params": {
+            "tp_per_trade": params["tp_per_trade"],
+            "sl_per_trade": params["sl_per_trade"],
+        },
+        "daily_params": {
+            "target_pct": params["daily_target"],
+            "max_loss_pct": params["daily_max_loss"],
+            "pnl_today": pnl_today,
+        },
+    }
+
+    # 3) Regla de hora límite (hard close)
+    if positions and is_after_close_time():
+        result = close_all_via_api()
+        actions["closed_all"] = True
+        actions["reason_all"] = "Hora límite 15:45 ET"
+        actions["close_all_response"] = result
+        return {
+            "status": "ok",
+            "mode": exec_mode,
+            "risk_mode": risk_mode,
+            "actions": actions,
+        }
+
+    # 4) Reglas de P&L diario
+    if positions and pnl_today >= daily_target_abs:
+        result = close_all_via_api()
+        actions["closed_all"] = True
+        actions["reason_all"] = "Meta diaria alcanzada"
+        actions["close_all_response"] = result
+        return {
+            "status": "ok",
+            "mode": exec_mode,
+            "risk_mode": risk_mode,
+            "actions": actions,
+        }
+
+    if positions and pnl_today <= daily_max_loss_abs:
+        result = close_all_via_api()
+        actions["closed_all"] = True
+        actions["reason_all"] = "Pérdida diaria máxima alcanzada"
+        actions["close_all_response"] = result
+        return {
+            "status": "ok",
+            "mode": exec_mode,
+            "risk_mode": risk_mode,
+            "actions": actions,
+        }
+
+    # 5) Gestión por trade (take profit / stop loss)
+    for pos in positions:
+        symbol = pos.get("symbol")
+        if not symbol:
+            continue
+
+        # Alpaca devuelve unrealized_plpc como fracción: 0.10 = +10%
+        try:
+            plpc = float(pos.get("unrealized_plpc", 0.0))
+        except (TypeError, ValueError):
+            plpc = 0.0
+
+        if plpc >= params["tp_per_trade"]:
+            resp = close_symbol_via_api(symbol)
+            actions["closed_symbols"].append(
+                {
+                    "symbol": symbol,
+                    "reason": f"Take profit alcanzado ({plpc:.2%})",
+                    "api_response": resp,
+                }
+            )
+        elif plpc <= -params["sl_per_trade"]:
+            resp = close_symbol_via_api(symbol)
+            actions["closed_symbols"].append(
+                {
+                    "symbol": symbol,
+                    "reason": f"Stop loss alcanzado ({plpc:.2%})",
+                    "api_response": resp,
+                }
+            )
 
     return {
         "status": "ok",
-        "detail": "Monitor tick ejecutado con gestión de posiciones (TP/SL/EOD) BDV."
+        "mode": exec_mode,
+        "risk_mode": risk_mode,
+        "positions_count": len(positions),
+        "actions": actions,
     }
