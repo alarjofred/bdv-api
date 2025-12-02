@@ -2,7 +2,7 @@ from fastapi import APIRouter, HTTPException
 import os
 import requests
 
-# Router específico para operaciones de cierre con Alpaca
+# Router específico para operaciones con Alpaca
 router = APIRouter(prefix="/alpaca", tags=["alpaca"])
 
 
@@ -26,34 +26,81 @@ def get_alpaca_headers() -> dict:
     }
 
 
+def get_trading_base_url() -> str:
+    """
+    Construye la URL base correcta para el trading de Alpaca.
+
+    Usa por defecto el entorno PAPER:
+    https://paper-api.alpaca.markets/v2
+    """
+    trading_url = os.getenv(
+        "APCA_TRADING_URL",
+        "https://paper-api.alpaca.markets",
+    ).rstrip("/")
+    return f"{trading_url}/v2"
+
+
+# ---------------------------------------------------------------------
+#  GET /alpaca/positions  → ver todas las posiciones (debug)
+# ---------------------------------------------------------------------
+@router.get("/positions")
+def get_positions():
+    """
+    Devuelve todas las posiciones abiertas en Alpaca (acciones y opciones).
+    Sirve para debug: ver exactamente qué símbolos ve la API.
+    """
+    base_url = get_trading_base_url()
+    headers = get_alpaca_headers()
+
+    try:
+        resp = requests.get(f"{base_url}/positions", headers=headers, timeout=10)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error llamando a Alpaca para leer posiciones: {e}",
+        )
+
+    if resp.status_code != 200:
+        body = resp.json() if resp.text else {}
+        raise HTTPException(
+            status_code=resp.status_code,
+            detail={
+                "message": "Error leyendo posiciones en Alpaca",
+                "alpaca_status": resp.status_code,
+                "alpaca_body": body,
+            },
+        )
+
+    return resp.json()
+
+
+# ---------------------------------------------------------------------
+#  POST /alpaca/close-all  → cerrar TODO
+# ---------------------------------------------------------------------
 @router.post("/close-all")
 def close_all_positions():
     """
     Cierra TODAS las posiciones abiertas en Alpaca al mejor precio disponible.
     Úsalo solo cuando quieras salir completamente del mercado.
     """
-    trading_url = os.getenv(
-        "APCA_TRADING_URL",
-        "https://paper-api.alpaca.markets/v2",
-    ).rstrip("/")
-
-    url = f"{trading_url}/positions"
+    base_url = get_trading_base_url()
+    headers = get_alpaca_headers()
 
     try:
-        r = requests.delete(url, headers=get_alpaca_headers(), timeout=10)
-        body = r.json() if r.text else {}
+        resp = requests.delete(f"{base_url}/positions", headers=headers, timeout=10)
+        body = resp.json() if resp.text else {}
     except Exception as e:
         raise HTTPException(
             status_code=500,
             detail=f"Error llamando a Alpaca: {e}",
         )
 
-    if r.status_code >= 400:
+    if resp.status_code >= 400:
         raise HTTPException(
             status_code=502,
             detail={
                 "message": "Error cerrando posiciones en Alpaca",
-                "alpaca_status": r.status_code,
+                "alpaca_status": resp.status_code,
                 "alpaca_body": body,
             },
         )
@@ -61,80 +108,73 @@ def close_all_positions():
     return {"status": "ok", "closed": body}
 
 
+# ---------------------------------------------------------------------
+#  POST /alpaca/close/{symbol}  → cerrar un símbolo (acción u opción)
+# ---------------------------------------------------------------------
 @router.post("/close/{symbol}")
 def close_symbol(symbol: str):
     """
     Cierra la posición abierta en un símbolo específico (si existe).
-    Ejemplo: POST /alpaca/close/QQQ
 
-    Ahora usa asset_id para cerrar, que es más robusto para opciones.
+    Ejemplos:
+    - POST /alpaca/close/QQQ
+    - POST /alpaca/close/QQQ251202C00621000   (opción de QQQ)
     """
-    trading_url = os.getenv(
-        "APCA_TRADING_URL",
-        "https://paper-api.alpaca.markets/v2",
-    ).rstrip("/")
-
-    symbol_up = symbol.upper()
+    base_url = get_trading_base_url()
     headers = get_alpaca_headers()
+    symbol_up = symbol.upper()
 
     # 1) Leer TODAS las posiciones de Alpaca
     try:
-        positions_url = f"{trading_url}/positions"
-        r = requests.get(positions_url, headers=headers, timeout=10)
-        if r.status_code not in (200, 404):
-            body = r.json() if r.text else {}
-            raise HTTPException(
-                status_code=502,
-                detail={
-                    "message": "Error leyendo posiciones en Alpaca",
-                    "alpaca_status": r.status_code,
-                    "alpaca_body": body,
-                },
-            )
-
-        if r.status_code == 404:
-            positions = []
-        else:
-            positions = r.json()
-
+        positions_resp = requests.get(f"{base_url}/positions", headers=headers, timeout=10)
     except Exception as e:
         raise HTTPException(
             status_code=500,
             detail=f"Error llamando a Alpaca para leer posiciones: {e}",
         )
 
-    # 2) Buscar la posición cuyo 'symbol' coincida
-    asset_id = None
-    for p in positions:
-        if str(p.get("symbol", "")).upper() == symbol_up:
-            asset_id = p.get("asset_id")
-            break
-
-    if not asset_id:
-        # No hay posición para ese símbolo
+    if positions_resp.status_code != 200:
+        body = positions_resp.json() if positions_resp.text else {}
         raise HTTPException(
-            status_code=404,
-            detail=f"No hay posición abierta en {symbol_up}",
+            status_code=502,
+            detail={
+                "message": "Error leyendo posiciones en Alpaca",
+                "alpaca_status": positions_resp.status_code,
+                "alpaca_body": body,
+            },
         )
 
-    # 3) Cerrar usando asset_id (forma más robusta)
-    close_url = f"{trading_url}/positions/{asset_id}"
+    positions = positions_resp.json()
 
+    # 2) Buscar si existe una posición EXACTAMENTE con ese símbolo
+    symbols_open = [str(p.get("symbol", "")).upper() for p in positions]
+
+    if symbol_up not in symbols_open:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No hay posición abierta en {symbol_up}. Posiciones abiertas: {symbols_open}",
+        )
+
+    # 3) Cerrar la posición usando el símbolo (así lo requiere Alpaca)
     try:
-        r = requests.delete(close_url, headers=headers, timeout=10)
-        body = r.json() if r.text else {}
+        close_resp = requests.delete(
+            f"{base_url}/positions/{symbol_up}",
+            headers=headers,
+            timeout=10,
+        )
+        body = close_resp.json() if close_resp.text else {}
     except Exception as e:
         raise HTTPException(
             status_code=500,
             detail=f"Error llamando a Alpaca para cerrar posición: {e}",
         )
 
-    if r.status_code >= 400:
+    if close_resp.status_code >= 400:
         raise HTTPException(
             status_code=502,
             detail={
                 "message": "Error cerrando posición en Alpaca",
-                "alpaca_status": r.status_code,
+                "alpaca_status": close_resp.status_code,
                 "alpaca_body": body,
             },
         )
@@ -142,6 +182,5 @@ def close_symbol(symbol: str):
     return {
         "status": "ok",
         "symbol": symbol_up,
-        "asset_id": asset_id,
         "closed": body,
     }
