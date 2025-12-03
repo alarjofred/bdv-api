@@ -71,13 +71,17 @@ def place_trade(payload: dict):
             detail="El campo 'qty' debe ser numérico entero",
         )
 
-    trading_url = os.getenv(
+    # Leemos la base, pero nos aseguramos de que SIEMPRE tenga /v2
+    base_url = os.getenv(
         "APCA_TRADING_URL",
         "https://paper-api.alpaca.markets/v2",
     ).rstrip("/")
 
-    # ESTA es la URL exacta que queremos ver en caso de error
-    url = f"{trading_url}/orders"
+    if not base_url.endswith("/v2"):
+        base_url = base_url.rstrip("/") + "/v2"
+
+    # 👉 ESTA es la URL final CORRECTA: .../v2/orders
+    url = f"{base_url}/orders"
 
     body = {
         "symbol": str(symbol),
@@ -100,7 +104,7 @@ def place_trade(payload: dict):
         )
 
     if r.status_code >= 400:
-        # AHORA veremos la URL exacta que Alpaca dijo 404
+        # Propagamos el error de Alpaca (pero ya con la URL correcta)
         raise HTTPException(
             status_code=502,
             detail={
@@ -111,7 +115,6 @@ def place_trade(payload: dict):
             },
         )
 
-    # En caso de éxito, también devolvemos la URL para confirmar
     return {
         "status": "ok",
         "alpaca_url": url,
