@@ -2,6 +2,9 @@ from fastapi import APIRouter, HTTPException
 import os
 import requests
 
+# 🔔 Import para enviar mensajes a Telegram
+from routes.telegram_notify import send_telegram_message
+
 router = APIRouter(tags=["trade"])
 
 
@@ -115,8 +118,25 @@ def place_trade(payload: dict):
             },
         )
 
+    # 🔔 Si llegamos aquí, la orden se envió OK a Alpaca → mandamos alerta a Telegram
+    try:
+        status_text = data.get("status", "desconocido")
+    except AttributeError:
+        status_text = "desconocido"
+
+    message = (
+        "⚡ <b>BDV OPTIONS LIVE — Nueva operación</b>\n"
+        f"Símbolo: <b>{symbol}</b>\n"
+        f"Side: <b>{side.upper()}</b>\n"
+        f"Cantidad: <b>{qty_int}</b>\n"
+        f"Estado Alpaca: <code>{status_text}</code>"
+    )
+
+    telegram_result = send_telegram_message(message)
+
     return {
         "status": "ok",
         "alpaca_url": url,
         "alpaca_order": data,
+        "telegram_notify": telegram_result,
     }
