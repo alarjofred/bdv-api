@@ -59,7 +59,7 @@ app.include_router(monitor_router)
 app.include_router(signals_ai_router)
 app.include_router(alpaca_close_router)
 app.include_router(trade.router)
-from routes import telegram_notify
+app.include_router(telegram_notify.router)
 
 # ---------------------------------
 # Función auxiliar: último trade
@@ -222,5 +222,6 @@ def get_trades_log(limit: int = 10):
     except Exception as e:
         print(f"[ERR] /trades-log: {e}")
         raise HTTPException(status_code=500, detail=f"Error reading trades log: {e}")
+
 
 
