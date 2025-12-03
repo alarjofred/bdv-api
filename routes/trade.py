@@ -4,6 +4,7 @@ import requests
 
 router = APIRouter(tags=["trade"])
 
+
 def get_alpaca_headers() -> dict:
     """
     Headers para autenticar contra Alpaca.
@@ -55,11 +56,19 @@ def place_trade(payload: dict):
             detail="Faltan campos en la orden. Requiere: symbol, side, qty",
         )
 
-    side = side.lower()
+    side = str(side).lower().strip()
     if side not in ("buy", "sell"):
         raise HTTPException(
             status_code=400,
             detail="El campo 'side' debe ser 'buy' o 'sell'",
+        )
+
+    try:
+        qty_int = int(qty)
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="El campo 'qty' debe ser numérico entero",
         )
 
     trading_url = os.getenv(
@@ -67,11 +76,12 @@ def place_trade(payload: dict):
         "https://paper-api.alpaca.markets/v2",
     ).rstrip("/")
 
+    # ESTA es la URL exacta que queremos ver en caso de error
     url = f"{trading_url}/orders"
 
     body = {
         "symbol": str(symbol),
-        "qty": str(qty),
+        "qty": str(qty_int),
         "side": side,
         "type": "market",
         "time_in_force": "day",
@@ -83,21 +93,27 @@ def place_trade(payload: dict):
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Error llamando a Alpaca para enviar orden: {e}",
+            detail={
+                "message": f"Error llamando a Alpaca para enviar orden: {e}",
+                "alpaca_url": url,
+            },
         )
 
     if r.status_code >= 400:
-        # Propagamos el error de Alpaca para verlo claro en Swagger / GPT
+        # AHORA veremos la URL exacta que Alpaca dijo 404
         raise HTTPException(
             status_code=502,
             detail={
                 "message": "Error al enviar orden a Alpaca",
                 "alpaca_status": r.status_code,
+                "alpaca_url": url,
                 "alpaca_body": data,
             },
         )
 
+    # En caso de éxito, también devolvemos la URL para confirmar
     return {
         "status": "ok",
+        "alpaca_url": url,
         "alpaca_order": data,
     }
