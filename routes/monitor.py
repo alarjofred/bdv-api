@@ -208,13 +208,17 @@ def _get_snapshot_prices() -> Dict[str, Dict[str, Any]]:
         return {}
 
 
-def _process_pending_trades(snapshot_data: Dict[str, Dict[str, Any]]):
+def _process_pending_trades(snapshot_data: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Revisa PENDING_TRADES y ejecuta las órdenes condicionales
     que cumplan la condición de precio.
+
+    Devuelve una lista-resumen de las órdenes disparadas en este tick.
     """
     now = datetime.utcnow()
+    ejecuciones: List[Dict[str, Any]] = []
 
+    # En pending_trades.py PENDING_TRADES es un dict {id: PendingTrade}
     for trade in list(PENDING_TRADES.values()):
         if trade.status != "pending":
             continue
@@ -222,6 +226,16 @@ def _process_pending_trades(snapshot_data: Dict[str, Dict[str, Any]]):
         # 1) Vigencia
         if trade.valid_until and now > trade.valid_until:
             trade.status = "expired"
+            trade.expired_at = now
+            ejecuciones.append(
+                {
+                    "id": trade.id,
+                    "symbol": trade.symbol,
+                    "side": trade.side,
+                    "status": "expired",
+                    "reason": "valid_until alcanzado",
+                }
+            )
             continue
 
         info = snapshot_data.get(trade.symbol)
@@ -233,14 +247,37 @@ def _process_pending_trades(snapshot_data: Dict[str, Dict[str, Any]]):
             continue
 
         # 2) Lógica simple: BUY si precio >= trigger_price y (<= max_price si se definió)
+        condition_met = False
         if trade.side == "buy":
             if price >= trade.trigger_price and (
                 trade.max_price is None or price <= trade.max_price
             ):
-                _execute_trade_via_http(trade.symbol, trade.side, trade.qty)
-                trade.status = "triggered"
-        # (En el futuro se puede extender para side == "sell")
-        
+                condition_met = True
+        # (en el futuro se puede extender para side == "sell")
+
+        if not condition_met:
+            continue
+
+        # 3) Ejecutar orden vía /trade
+        _execute_trade_via_http(trade.symbol, trade.side, trade.qty)
+        trade.status = "triggered"
+        trade.triggered_at = now
+
+        ejecuciones.append(
+            {
+                "id": trade.id,
+                "symbol": trade.symbol,
+                "side": trade.side,
+                "qty": trade.qty,
+                "trigger_price": trade.trigger_price,
+                "max_price": trade.max_price,
+                "price_at_trigger": price,
+                "status": "triggered",
+            }
+        )
+
+    return ejecuciones
+
 
 @router.get("/tick")
 def monitor_tick():
@@ -294,6 +331,7 @@ def monitor_tick():
             "max_loss_pct": params["daily_max_loss"],
             "pnl_today": pnl_today,
         },
+        "pending_trades_executed": [],
     }
 
     # 3) Regla de hora límite (hard close)
@@ -368,10 +406,10 @@ def monitor_tick():
     # 6) Procesar órdenes condicionales (aunque no haya posiciones aún)
     snapshot_data = _get_snapshot_prices()
     try:
-        _process_pending_trades(snapshot_data)
+        actions["pending_trades_executed"] = _process_pending_trades(snapshot_data)
     except Exception:
         # Cualquier fallo aquí NO debe romper el monitor
-        pass
+        actions["pending_trades_executed"] = []
 
     return {
         "status": "ok",
