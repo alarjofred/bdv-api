@@ -3,6 +3,7 @@ import os
 import requests
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List
+from routes.pending_trades import PENDING_TRADES
 
 router = APIRouter(prefix="/monitor", tags=["monitor"])
 
@@ -168,10 +169,83 @@ def close_symbol_via_api(symbol: str) -> Dict[str, Any]:
         )
 
 
+# -----------------------------------------
+# Ejecutar /trade vía HTTP (sin tocar trade.py)
+# -----------------------------------------
+def _execute_trade_via_http(symbol: str, side: str, qty: int):
+    """
+    Ejecuta una orden REAL usando tu propio endpoint /trade.
+    Esto evita modificar trade.py directamente.
+    """
+    if not API_BASE:
+        return
+
+    url = f"{API_BASE.rstrip('/')}/trade"
+    payload = {"symbol": symbol, "side": side, "qty": qty}
+
+    try:
+        r = requests.post(url, json=payload, timeout=5)
+        r.raise_for_status()
+    except Exception:
+        # No rompemos el monitor si falla
+        pass
+
+
+def _get_snapshot_prices() -> Dict[str, Dict[str, Any]]:
+    """
+    Llama a /snapshot en tu propia API y devuelve el dict de precios.
+    Esperado: {"data": {"QQQ": {"price": ...}, "SPY": {...}, ...}}
+    """
+    if not API_BASE:
+        return {}
+
+    try:
+        resp = requests.get(f"{API_BASE}/snapshot", timeout=5)
+        data = resp.json()
+        return data.get("data", {})
+    except Exception:
+        return {}
+
+
+def _process_pending_trades(snapshot_data: Dict[str, Dict[str, Any]]):
+    """
+    Revisa PENDING_TRADES y ejecuta las órdenes condicionales
+    que cumplan la condición de precio.
+    """
+    now = datetime.utcnow()
+
+    for trade in list(PENDING_TRADES.values()):
+        if trade.status != "pending":
+            continue
+
+        # 1) Vigencia
+        if trade.valid_until and now > trade.valid_until:
+            trade.status = "expired"
+            continue
+
+        info = snapshot_data.get(trade.symbol)
+        if not info:
+            continue
+
+        price = info.get("price")
+        if price is None:
+            continue
+
+        # 2) Lógica simple: BUY si precio >= trigger_price y (<= max_price si se definió)
+        if trade.side == "buy":
+            if price >= trade.trigger_price and (
+                trade.max_price is None or price <= trade.max_price
+            ):
+                _execute_trade_via_http(trade.symbol, trade.side, trade.qty)
+                trade.status = "triggered"
+        # (En el futuro se puede extender para side == "sell")
+        
+
 @router.get("/tick")
 def monitor_tick():
     """
-    Monitoriza posiciones abiertas y aplica la estrategia de salidas automáticas (Opción A):
+    Monitoriza posiciones abiertas y aplica la estrategia de salidas automáticas (Opción A)
+    y, además, procesa órdenes condicionales pendientes:
 
     - Respeta execution_mode de /config/status (solo actúa en modo 'auto')
     - Cierra TODO por:
@@ -181,8 +255,8 @@ def monitor_tick():
     - Cierra símbolos individuales por:
         * take profit por trade
         * stop loss por trade
-
-    Devuelve un resumen de las acciones ejecutadas en este 'tick'.
+    - Revisa órdenes condicionales en PENDING_TRADES y ejecuta /trade cuando
+      se cumplan las condiciones de precio.
     """
     # 1) Leer configuración
     config = get_config_status()
@@ -289,6 +363,14 @@ def monitor_tick():
                     "api_response": resp,
                 }
             )
+
+    # 6) Procesar órdenes condicionales (aunque no haya posiciones aún)
+    snapshot_data = _get_snapshot_prices()
+    try:
+        _process_pending_trades(snapshot_data)
+    except Exception:
+        # Cualquier fallo aquí NO debe romper el monitor
+        pass
 
     return {
         "status": "ok",
