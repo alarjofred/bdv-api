@@ -3,7 +3,8 @@ import os
 import requests
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List
-from routes.pending_trades import PENDING_TRADES
+from .pending_trades import PENDING_TRADES
+
 
 router = APIRouter(prefix="/monitor", tags=["monitor"])
 
