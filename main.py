@@ -44,6 +44,7 @@ from routes.signals_ai import router as signals_ai_router
 from routes.alpaca_close import router as alpaca_close_router
 from routes import trade
 from routes import telegram_notify
+from routes import pending_trades
 
 # ---------------------------------
 # Inicializar FastAPI
@@ -60,6 +61,7 @@ app.include_router(signals_ai_router)
 app.include_router(alpaca_close_router)
 app.include_router(trade.router)
 app.include_router(telegram_notify.router)
+app.include_router(pending_trades.router)
 
 # ---------------------------------
 # Función auxiliar: último trade
@@ -222,6 +224,7 @@ def get_trades_log(limit: int = 10):
     except Exception as e:
         print(f"[ERR] /trades-log: {e}")
         raise HTTPException(status_code=500, detail=f"Error reading trades log: {e}")
+
 
 
 
