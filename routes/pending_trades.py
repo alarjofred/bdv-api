@@ -7,8 +7,12 @@ import os
 
 router = APIRouter(prefix="/pending-trades", tags=["pending-trades"])
 
+# ----------------------------------------
 # Ruta persistente en Render (carpeta segura)
-DATA_DIR = "/app/data"
+# Render NO permite escribir en /app → solo lectura
+# /data SÍ tiene permisos de escritura
+# ----------------------------------------
+DATA_DIR = "/data"
 os.makedirs(DATA_DIR, exist_ok=True)
 
 PENDING_TRADES_FILE = f"{DATA_DIR}/pending_trades.json"
@@ -27,9 +31,9 @@ class PendingTrade(BaseModel):
     status: Literal["pending", "triggered", "cancelled", "expired"] = "pending"
 
 
-# ---------------------------
+# ----------------------------------------
 # Funciones de persistencia
-# ---------------------------
+# ----------------------------------------
 
 def load_pending_trades() -> List[PendingTrade]:
     if not os.path.isfile(PENDING_TRADES_FILE):
@@ -52,9 +56,9 @@ def save_pending_trades(data: List[PendingTrade]):
 PENDING_TRADES: List[PendingTrade] = load_pending_trades()
 
 
-# ---------------------------
+# ----------------------------------------
 # ENDPOINTS
-# ---------------------------
+# ----------------------------------------
 
 @router.get("/", response_model=List[PendingTrade])
 def list_pending_trades():
