@@ -3,7 +3,7 @@ import os
 import requests
 
 # 🔔 Import para enviar mensajes a Telegram
-from routes.telegram_notify import send_telegram_message
+from routes.telegram_notify import send_telegram_message, send_alert
 
 router = APIRouter(tags=["trade"])
 
@@ -34,19 +34,6 @@ def get_alpaca_headers() -> dict:
 def place_trade(payload: dict):
     """
     Enviar una orden a Alpaca (acciones u opciones).
-
-    Espera un body como:
-    {
-      "symbol": "QQQ" o "QQQ251202C00621000",
-      "side": "buy" o "sell",
-      "qty": 1
-    }
-
-    Siempre envía:
-      - type = "market"
-      - time_in_force = "day"
-
-    Alpaca detecta si es acción u opción según el símbolo.
     """
 
     symbol = payload.get("symbol")
@@ -74,7 +61,6 @@ def place_trade(payload: dict):
             detail="El campo 'qty' debe ser numérico entero",
         )
 
-    # Leemos la base, pero nos aseguramos de que SIEMPRE tenga /v2
     base_url = os.getenv(
         "APCA_TRADING_URL",
         "https://paper-api.alpaca.markets/v2",
@@ -83,7 +69,6 @@ def place_trade(payload: dict):
     if not base_url.endswith("/v2"):
         base_url = base_url.rstrip("/") + "/v2"
 
-    # 👉 ESTA es la URL final CORRECTA: .../v2/orders
     url = f"{base_url}/orders"
 
     body = {
@@ -93,6 +78,20 @@ def place_trade(payload: dict):
         "type": "market",
         "time_in_force": "day",
     }
+
+    # 🔔 Notificación 1: ORDEN SOLICITADA DESDE GPT BDV
+    try:
+        send_alert("execution", {
+            "symbol": symbol,
+            "side": side,
+            "qty": qty_int,
+            "price": "market",
+            "target": "-",
+            "stop": "-",
+            "mode": "Solicitud desde GPT BDV"
+        })
+    except Exception as e:
+        print(f"[WARN] No se pudo enviar alerta de solicitud: {e}")
 
     try:
         r = requests.post(url, headers=get_alpaca_headers(), json=body, timeout=10)
@@ -107,7 +106,6 @@ def place_trade(payload: dict):
         )
 
     if r.status_code >= 400:
-        # Propagamos el error de Alpaca (pero ya con la URL correcta)
         raise HTTPException(
             status_code=502,
             detail={
@@ -118,12 +116,26 @@ def place_trade(payload: dict):
             },
         )
 
-    # 🔔 Si llegamos aquí, la orden se envió OK a Alpaca → mandamos alerta a Telegram
+    # 🔔 Notificación 2: ORDEN EJECUTADA EN ALPACA
     try:
-        status_text = data.get("status", "desconocido")
+        status_text = data.get("status", "pendiente")
     except AttributeError:
-        status_text = "desconocido"
+        status_text = "pendiente"
 
+    try:
+        send_alert("execution", {
+            "symbol": symbol,
+            "side": side,
+            "qty": qty_int,
+            "price": data.get("filled_avg_price", "market"),
+            "target": "-",
+            "stop": "-",
+            "mode": "Paper" if "paper" in base_url else "Live"
+        })
+    except Exception as e:
+        print(f"[WARN] No se pudo enviar alerta de ejecución: {e}")
+
+    # Mensaje de texto clásico (lo tuyo original)
     message = (
         "⚡ <b>BDV OPTIONS LIVE — Nueva operación</b>\n"
         f"Símbolo: <b>{symbol}</b>\n"
@@ -131,7 +143,6 @@ def place_trade(payload: dict):
         f"Cantidad: <b>{qty_int}</b>\n"
         f"Estado Alpaca: <code>{status_text}</code>"
     )
-
     telegram_result = send_telegram_message(message)
 
     return {
@@ -140,3 +151,25 @@ def place_trade(payload: dict):
         "alpaca_order": data,
         "telegram_notify": telegram_result,
     }
+
+
+# =====================================================
+# 🔒 NUEVO ENDPOINT DE CIERRE DE OPERACIÓN
+# =====================================================
+@router.post("/trade/close")
+def close_trade(symbol: str, reason: str = "Target alcanzado +10%", pl: str = "+10%"):
+    """
+    Simula cierre de operación o salida real.
+    Envía notificación a Telegram cuando se cumple la señal de salida.
+    """
+    try:
+        send_alert("close", {
+            "symbol": symbol,
+            "reason": reason,
+            "pl": pl,
+            "percent": pl
+        })
+        return {"status": "ok", "message": f"Operación {symbol} cerrada y notificada."}
+    except Exception as e:
+        print(f"[ERR] No se pudo enviar alerta de cierre: {e}")
+        raise HTTPException(status_code=500, detail=f"Error notificando cierre: {e}")
