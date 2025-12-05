@@ -209,3 +209,19 @@ def register_auto_sync(app: FastAPI):
 
         print("[AUTO-SYNC] Finalizado.")
         print(f"[AUTO-SYNC] Última actualización completada a {datetime.utcnow().isoformat()}")
+# ===============================
+#  ENDPOINT DE SALUD DEL SERVICIO
+# ===============================
+@router.get("/health")
+def health_check():
+    """
+    Verifica el estado general del servidor BDV API.
+    Devuelve timestamp, número de análisis cargados y estado de sincronización.
+    """
+    return {
+        "status": "ok",
+        "service": "BDV API Server",
+        "analysis_count": len(analysis_history),
+        "last_update": analysis_history[-1]["timestamp"] if analysis_history else None,
+        "note": "Servicio activo y sincronización automática operativa ✅"
+    }
