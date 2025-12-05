@@ -6,7 +6,7 @@ httpx
 pytz
 alpaca-trade-api
 fastapi-utils
-
+typing-inspect
 
 
 
