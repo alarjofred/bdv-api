@@ -4,26 +4,26 @@ import os
 import numpy as np
 from fastapi import APIRouter
 import json
-from datetime import datetime  # ✅ agregado para manejo de fecha y hora
+from datetime import datetime  # ✅ Manejo de fecha y hora
 
 router = APIRouter(prefix="/analysis", tags=["analysis"])
 
 # ===============================
-#  LOG DE ANÁLISIS (nuevo bloque)
+#  LOG DE ANÁLISIS
 # ===============================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(BASE_DIR, "analysis-log.jsonl")  # ✅ Log local en carpeta routes
 
-# 🧠 Memoria temporal para guardar los análisis (Render no persiste archivos)
+# 🧠 Memoria temporal (Render no guarda archivos entre reinicios)
 analysis_history = []
 
 def append_analysis_log(entry: dict):
-    """Guarda el resultado en lista temporal y opcionalmente en archivo local."""
+    """Guarda el resultado en memoria y opcionalmente en archivo local."""
     try:
-        # 🧠 Guardar en memoria para el endpoint /analysis/history
+        # 🧠 Guardar en memoria temporal
         analysis_history.append(entry)
 
-        # 💾 Intentar también escribir en el log local (sin romper si falla)
+        # 💾 Guardar también en archivo local (opcional, tolera errores)
         line = json.dumps(entry, ensure_ascii=False)
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(line + "\n")
@@ -38,6 +38,7 @@ APCA_API_SECRET_KEY = os.getenv("APCA_API_SECRET_KEY")
 APCA_DATA_URL = os.getenv("APCA_DATA_URL", "https://data.alpaca.markets/v2")
 
 def alpaca_headers():
+    """Cabeceras de autenticación para API de Alpaca."""
     return {
         "APCA-API-KEY-ID": APCA_API_KEY_ID,
         "APCA-API-SECRET-KEY": APCA_API_SECRET_KEY,
@@ -53,12 +54,12 @@ def ema(values, period=20):
         return np.mean(values)
     weights = np.exp(np.linspace(-1., 0., period))
     weights /= weights.sum()
-    a = np.convolve(values, weights, mode='full')[:len(values)]
+    a = np.convolve(values, weights, mode="full")[:len(values)]
     a[:period] = a[period]
     return a[-1]
 
 def calc_rsi(closes, period=14):
-    """Cálculo manual de RSI."""
+    """Cálculo manual del RSI."""
     deltas = np.diff(closes)
     seed = deltas[:period]
     up = seed[seed >= 0].sum() / period
@@ -87,6 +88,10 @@ def get_market_bias(symbol: str):
     r = requests.get(url, headers=alpaca_headers(), timeout=10)
     r.raise_for_status()
     bars = r.json().get("bars", [])
+    
+    if not bars:
+        return {"symbol": symbol, "bias": "neutral", "note": "No se recibieron datos"}
+
     closes = np.array([b["c"] for b in bars])
     volumes = np.array([b["v"] for b in bars])
 
@@ -102,9 +107,12 @@ def get_market_bias(symbol: str):
 
     # --- Panel técnico de decisión ---
     score = 0
-    if price > ema9 > ema20: score += 1
-    if rsi > 55: score += 1
-    if vol_ratio > 1.1: score += 1
+    if price > ema9 > ema20:
+        score += 1
+    if rsi > 55:
+        score += 1
+    if vol_ratio > 1.1:
+        score += 1
 
     if score >= 2:
         bias = "bullish"
@@ -116,7 +124,7 @@ def get_market_bias(symbol: str):
         bias = "bearish"
         confidence = 0.7
 
-    # ✅ --- Guardar log histórico ---
+    # ✅ Guardar log histórico
     log_entry = {
         "timestamp": datetime.utcnow().isoformat(),
         "symbol": symbol,
@@ -130,17 +138,8 @@ def get_market_bias(symbol: str):
     }
     append_analysis_log(log_entry)
 
-    # --- Retorno normal del endpoint ---
-    return {
-        "symbol": symbol,
-        "price": round(price, 2),
-        "ema9": round(ema9, 2),
-        "ema20": round(ema20, 2),
-        "rsi": round(rsi, 2),
-        "volume_ratio": round(vol_ratio, 2),
-        "bias": bias,
-        "confidence": round(confidence, 2),
-    }
+    # --- Retorno normal ---
+    return log_entry
 
 # ===============================
 #  ENDPOINT: HISTORIAL TEMPORAL
@@ -149,9 +148,8 @@ def get_market_bias(symbol: str):
 def get_analysis_history(limit: int = 10):
     """
     Devuelve los últimos análisis guardados en memoria temporal.
-    No usa archivos físicos (ideal para Render).
+    Ideal para Render (sin archivos persistentes).
     """
-    # Devuelve los últimos 'limit' registros (por defecto 10)
     return list(reversed(analysis_history[-limit:]))
 
 # ===============================
@@ -166,11 +164,11 @@ def sync_analysis_data():
     if not analysis_history:
         return {"status": "empty", "message": "No hay datos para sincronizar."}
 
-    # Agrupar por símbolo (último análisis por cada uno)
+    # Agrupar por símbolo (último análisis de cada uno)
     latest_by_symbol = {}
     for entry in reversed(analysis_history):
-        sym = entry["symbol"]
-        if sym not in latest_by_symbol:
+        sym = entry.get("symbol")
+        if sym and sym not in latest_by_symbol:
             latest_by_symbol[sym] = entry
 
     # Ordenar por nombre del símbolo
@@ -184,4 +182,3 @@ def sync_analysis_data():
         "synced": synced_data,
         "note": "Datos listos para integración con Panel IA BDV"
     }
-
