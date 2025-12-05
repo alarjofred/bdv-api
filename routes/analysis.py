@@ -153,3 +153,35 @@ def get_analysis_history(limit: int = 10):
     """
     # Devuelve los últimos 'limit' registros (por defecto 10)
     return list(reversed(analysis_history[-limit:]))
+
+# ===============================
+#  ENDPOINT: SINCRONIZACIÓN PANEL BDV
+# ===============================
+@router.get("/sync")
+def sync_analysis_data():
+    """
+    Endpoint de sincronización con el Panel IA BDV.
+    Devuelve la lista de análisis más recientes agrupados por símbolo.
+    """
+    if not analysis_history:
+        return {"status": "empty", "message": "No hay datos para sincronizar."}
+
+    # Agrupar por símbolo (último análisis por cada uno)
+    latest_by_symbol = {}
+    for entry in reversed(analysis_history):
+        sym = entry["symbol"]
+        if sym not in latest_by_symbol:
+            latest_by_symbol[sym] = entry
+
+    # Ordenar por nombre del símbolo
+    synced_data = [
+        {"symbol": sym, **latest_by_symbol[sym]} for sym in sorted(latest_by_symbol.keys())
+    ]
+
+    return {
+        "status": "ok",
+        "count": len(synced_data),
+        "synced": synced_data,
+        "note": "Datos listos para integración con Panel IA BDV"
+    }
+
