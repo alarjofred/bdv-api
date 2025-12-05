@@ -7,6 +7,10 @@ router = APIRouter()
 # URL base de tu propia API en Render
 API_BASE = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 
+# 🩵 agregado: fallback automático si la variable no existe o está vacía
+if not API_BASE:
+    API_BASE = "https://bdv-api-server.onrender.com"
+
 @router.get("/recommend")
 def recommend_trade():
     """
@@ -15,7 +19,10 @@ def recommend_trade():
     try:
         # 1) Llamar al endpoint /snapshot de esta misma API
         snapshot_url = f"{API_BASE}/snapshot"
-        resp = requests.get(snapshot_url)
+
+        # 🩵 agregado: timeout para evitar bloqueos si Render se demora
+        resp = requests.get(snapshot_url, timeout=10)
+
         resp.raise_for_status()
         snapshot = resp.json()
 
@@ -40,6 +47,17 @@ def recommend_trade():
             target = price
             stop = price
 
+            # 🩵 agregado: lógica condicional simple para dar análisis mínimo
+            if symbol == "QQQ" and price > 620:
+                bias, suggestion = "bullish", "buy calls"
+                target, stop = round(price * 1.02, 2), round(price * 0.98, 2)
+            elif symbol == "SPY" and price < 680:
+                bias, suggestion = "bearish", "buy puts"
+                target, stop = round(price * 0.98, 2), round(price * 1.02, 2)
+            elif symbol == "NVDA" and price > 190:
+                bias, suggestion = "bullish", "buy shares"
+                target, stop = round(price * 1.03, 2), round(price * 0.97, 2)
+
             recommendations.append({
                 "symbol": symbol,
                 "price": price,
@@ -56,4 +74,6 @@ def recommend_trade():
         }
 
     except Exception as e:
+        # 🩵 agregado: registro de errores en consola de Render
+        print(f"[ERR] /recommend: {e}")
         return {"status": "error", "message": str(e)}
