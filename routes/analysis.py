@@ -14,9 +14,16 @@ router = APIRouter(prefix="/analysis", tags=["analysis"])
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(BASE_DIR, "analysis-log.jsonl")  # ✅ Log local en carpeta routes
 
+# 🧠 Memoria temporal para guardar los análisis (Render no persiste archivos)
+analysis_history = []
+
 def append_analysis_log(entry: dict):
-    """Guarda el resultado de cada análisis en un archivo local .jsonl"""
+    """Guarda el resultado en lista temporal y opcionalmente en archivo local."""
     try:
+        # 🧠 Guardar en memoria para el endpoint /analysis/history
+        analysis_history.append(entry)
+
+        # 💾 Intentar también escribir en el log local (sin romper si falla)
         line = json.dumps(entry, ensure_ascii=False)
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(line + "\n")
@@ -134,11 +141,10 @@ def get_market_bias(symbol: str):
         "bias": bias,
         "confidence": round(confidence, 2),
     }
+
 # ===============================
 #  ENDPOINT: HISTORIAL TEMPORAL
 # ===============================
-analysis_history = []  # 🧠 Memoria temporal de análisis
-
 @router.get("/history")
 def get_analysis_history(limit: int = 10):
     """
@@ -147,15 +153,3 @@ def get_analysis_history(limit: int = 10):
     """
     # Devuelve los últimos 'limit' registros (por defecto 10)
     return list(reversed(analysis_history[-limit:]))
-
-# --- Sobrescribimos append_analysis_log para guardar también en memoria ---
-def append_analysis_log(entry: dict):
-    """Guarda el resultado en lista temporal y (opcionalmente) en archivo local."""
-    try:
-        analysis_history.append(entry)  # 🧠 Guardado en memoria
-        # También intenta escribir localmente (opcional, sin romper nada)
-        line = json.dumps(entry, ensure_ascii=False)
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
-    except Exception as e:
-        print(f"[WARN] No se pudo escribir el log de análisis: {e}")
