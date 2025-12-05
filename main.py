@@ -1,6 +1,5 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware  # 🆕 Importante
 from dotenv import load_dotenv
 from pydantic import BaseModel
 from typing import Optional, Literal
@@ -51,17 +50,6 @@ from routes import pending_trades
 # ---------------------------------
 app = FastAPI(title="BDV API", version="0.1.0")
 
-# 🆕 ---------------------------------
-# Middleware CORS (para permitir conexión desde tu GPT)
-# ---------------------------------
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # permite cualquier origen (tu GPT)
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 # ---------------------------------
 # Incluir routers
 # ---------------------------------
@@ -109,7 +97,7 @@ def market_snapshot():
         print(f"[ERR] /snapshot: {e}")
         raise HTTPException(status_code=500, detail=f"Error getting snapshot: {e}")
 
-# 🆕 ---------------------------------
+# ---------------------------------
 # Endpoint /recommend
 # ---------------------------------
 @app.get("/recommend")
