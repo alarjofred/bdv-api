@@ -257,4 +257,6 @@ def get_trades_log(limit: int = 10):
         print(f"[ERR] /trades-log: {e}")
         raise HTTPException(status_code=500, detail=f"Error reading trades log: {e}")
 
+from routes.analysis import register_auto_sync
+register_auto_sync(app)
 
