@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 from pydantic import BaseModel
 from typing import Optional, Literal
@@ -100,6 +101,49 @@ def market_snapshot():
     except Exception as e:
         print(f"[ERR] /snapshot: {e}")
         raise HTTPException(status_code=500, detail=f"Error getting snapshot: {e}")
+
+
+# 🆕 ---------------------------------
+# NUEVO BLOQUE: Endpoint /recommend
+# ---------------------------------
+@app.get("/recommend")
+def recommend():
+    """
+    Devuelve recomendaciones básicas de mercado.
+    """
+    data = {
+        "status": "ok",
+        "recommendations": [
+            {
+                "symbol": "QQQ",
+                "price": 622.91,
+                "bias": "neutral",
+                "suggestion": "wait",
+                "target": 622.91,
+                "stop": 622.91
+            },
+            {
+                "symbol": "SPY",
+                "price": 684.28,
+                "bias": "neutral",
+                "suggestion": "wait",
+                "target": 684.28,
+                "stop": 684.28
+            },
+            {
+                "symbol": "NVDA",
+                "price": 183.53,
+                "bias": "neutral",
+                "suggestion": "wait",
+                "target": 183.53,
+                "stop": 183.53
+            }
+        ],
+        "note": "Basado en snapshot. Lógica simple; el GPT BDV aplica análisis y gestión de riesgo."
+    }
+
+    # 🔹 devolvemos JSON con encabezado correcto
+    return JSONResponse(content=data)
 
 
 # ---------------------------------
@@ -224,7 +268,3 @@ def get_trades_log(limit: int = 10):
     except Exception as e:
         print(f"[ERR] /trades-log: {e}")
         raise HTTPException(status_code=500, detail=f"Error reading trades log: {e}")
-
-
-
-
