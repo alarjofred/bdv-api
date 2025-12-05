@@ -11,8 +11,8 @@ router = APIRouter(prefix="/analysis", tags=["analysis"])
 # ===============================
 #  LOG DE ANÁLISIS (nuevo bloque)
 # ===============================
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))   # ✅ Nueva línea
-LOG_FILE = os.path.join(BASE_DIR, "..", "analysis-log.jsonl")  # ✅ Nueva línea
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LOG_FILE = os.path.join(BASE_DIR, "analysis-log.jsonl")
 
 def append_analysis_log(entry: dict):
     """Guarda el resultado de cada análisis en un archivo local .jsonl"""
