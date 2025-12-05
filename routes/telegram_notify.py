@@ -43,6 +43,58 @@ def send_telegram_message(text: str):
         }
 
 
+# 🧩 NUEVA FUNCIÓN AÑADIDA AQUÍ
+def send_alert(event: str, data: dict):
+    """
+    Envía mensajes estructurados a Telegram según el tipo de evento BDV.
+    event: "signal", "execution", "close", "summary"
+    """
+    try:
+        if event == "signal":
+            text = (
+                f"📈 *Nueva señal IA BDV*\n"
+                f"Símbolo: {data.get('symbol')}\n"
+                f"Sesgo: {data.get('bias')}\n"
+                f"Acción sugerida: {data.get('suggestion')}\n"
+                f"Target: {data.get('target')} / Stop: {data.get('stop')}\n"
+                f"🧠 {data.get('note', '')}"
+            )
+
+        elif event == "execution":
+            text = (
+                f"✅ *Orden ejecutada*\n"
+                f"{data.get('symbol')} – {data.get('side').upper()} ({data.get('qty')} contratos)\n"
+                f"Precio entrada: {data.get('price')}\n"
+                f"Target: {data.get('target')} / Stop: {data.get('stop')}\n"
+                f"Modo: {data.get('mode', 'Auto/Paper')}"
+            )
+
+        elif event == "close":
+            text = (
+                f"🔒 *Cierre de posición*\n"
+                f"{data.get('symbol')} – {data.get('reason')}\n"
+                f"P/L: {data.get('pl', 'n/a')} ({data.get('percent', 'n/a')}%)"
+            )
+
+        elif event == "summary":
+            text = (
+                f"🧾 *Resumen BDV del día*\n"
+                f"Operaciones: {data.get('trades')}\n"
+                f"Ganancia total: {data.get('profit')}\n"
+                f"Riesgo: {data.get('risk_mode')}\n"
+                f"Modo: {data.get('execution_mode')}"
+            )
+
+        else:
+            text = f"ℹ️ Evento BDV: {event}\n{data}"
+
+        return send_telegram_message(text)
+
+    except Exception as e:
+        print(f"[ERR] send_alert: {e}")
+        return {"status": "error", "error": str(e)}
+
+
 @router.get("/telegram-test")
 def telegram_test():
     """
