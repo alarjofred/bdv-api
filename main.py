@@ -65,13 +65,13 @@ app.include_router(telegram_notify.router)
 app.include_router(pending_trades.router)
 
 # ---------------------------------
-# Función auxiliar: último trade
+# Función auxiliar: última cotización (bid/ask)
 # ---------------------------------
-def get_latest_trade(symbol: str) -> dict:
-    """Consulta el último trade de un símbolo en Alpaca (data API)."""
-    url = f"{APCA_DATA_URL}/stocks/{symbol}/trades/latest"
+def get_latest_quote(symbol: str) -> dict:
+    """Consulta la última cotización (bid/ask) en Alpaca para obtener precio más actual."""
+    url = f"{APCA_DATA_URL}/stocks/{symbol}/quotes/latest"
     r = requests.get(url, headers=alpaca_headers(), timeout=10)
-    print(f"[DBG] Alpaca latest trade {symbol}: {r.status_code} {r.text[:200]}")
+    print(f"[DBG] Alpaca latest quote {symbol}: {r.status_code} {r.text[:200]}")
     r.raise_for_status()
     return r.json()
 
@@ -81,21 +81,22 @@ def get_latest_trade(symbol: str) -> dict:
 @app.get("/snapshot")
 def market_snapshot():
     """
-    Devuelve último precio y hora de QQQ, SPY y NVDA.
+    Devuelve último precio y hora de QQQ, SPY y NVDA (usando quotes en vivo).
     """
     try:
         symbols = ["QQQ", "SPY", "NVDA"]
         data = {}
 
         for sym in symbols:
-            raw = get_latest_trade(sym)
-            trade = raw.get("trade", {}) or raw.get("trades", [{}])[0]
-            data[sym] = {"price": trade.get("p"), "time": trade.get("t")}
+            raw = get_latest_quote(sym)
+            quote = raw.get("quote", {}) or raw.get("quotes", [{}])[0]
+            data[sym] = {"price": quote.get("ap"), "time": quote.get("t")}
 
         return {"status": "ok", "data": data}
     except Exception as e:
         print(f"[ERR] /snapshot: {e}")
         raise HTTPException(status_code=500, detail=f"Error getting snapshot: {e}")
+
 
 # ---------------------------------
 # Endpoint /recommend
@@ -253,3 +254,4 @@ def get_trades_log(limit: int = 10):
     except Exception as e:
         print(f"[ERR] /trades-log: {e}")
         raise HTTPException(status_code=500, detail=f"Error reading trades log: {e}")
+
