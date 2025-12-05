@@ -1,4 +1,4 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Response
 import os
 import requests
 
@@ -11,7 +11,8 @@ API_BASE = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 if not API_BASE:
     API_BASE = "https://bdv-api-server.onrender.com"
 
-@router.get("/recommend")
+
+@router.get("/recommend", response_model=dict)
 def recommend_trade():
     """
     Genera recomendaciones simples usando los datos del endpoint /snapshot.
@@ -20,17 +21,17 @@ def recommend_trade():
     try:
         # 1️⃣ Llamar al endpoint /snapshot
         snapshot_url = f"{API_BASE}/snapshot"
-        resp = requests.get(snapshot_url, timeout=10)
+        resp = requests.get(snapshot_url, timeout=10, headers={"Accept": "application/json"})
         resp.raise_for_status()
         snapshot = resp.json()
 
         # 2️⃣ Validar estructura
         market = snapshot.get("data", {})
         if not market:
-            return {
-                "status": "error",
-                "message": "Respuesta de /snapshot no tiene campo 'data'"
-            }
+            return Response(
+                content='{"status":"error","message":"Respuesta de /snapshot no tiene campo data"}',
+                media_type="application/json"
+            )
 
         recommendations = []
 
@@ -58,8 +59,7 @@ def recommend_trade():
                 target, stop = round(price * 1.03, 2), round(price * 0.97, 2)
 
             # 🧠 MODO IA AVANZADA BDV
-            # Detecta momentum si hay desviaciones de ±1% del rango estimado
-            prev_close = price * 0.995  # simula precio previo (puedes mejorarlo)
+            prev_close = price * 0.995  # simula precio previo
             change_pct = round(((price - prev_close) / prev_close) * 100, 2)
 
             if abs(change_pct) >= 1.0:
@@ -81,16 +81,22 @@ def recommend_trade():
                 "suggestion": suggestion,
                 "target": target,
                 "stop": stop,
-                "ai_note": note_ai  # 🩵 agregado: comentario IA
+                "ai_note": note_ai
             })
 
         # 4️⃣ Respuesta final enriquecida
-        return {
-            "status": "ok",
-            "recommendations": recommendations,
-            "note": "Incluye análisis BDV IA para detectar momentum intradía.",
-        }
+        return Response(
+            content=json.dumps({
+                "status": "ok",
+                "recommendations": recommendations,
+                "note": "Incluye análisis BDV IA para detectar momentum intradía."
+            }),
+            media_type="application/json"
+        )
 
     except Exception as e:
         print(f"[ERR] /recommend: {e}")
-        return {"status": "error", "message": str(e)}
+        return Response(
+            content=json.dumps({"status": "error", "message": str(e)}),
+            media_type="application/json"
+        )
