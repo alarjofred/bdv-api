@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware  # 🆕 Importante
 from dotenv import load_dotenv
 from pydantic import BaseModel
 from typing import Optional, Literal
@@ -23,7 +24,6 @@ TRADES_LOG_FILE = "trades-log.jsonl"
 if not APCA_API_KEY_ID or not APCA_API_SECRET_KEY:
     raise RuntimeError("Faltan APCA_API_KEY_ID o APCA_API_SECRET_KEY en el entorno (.env o secretos de Render)")
 
-
 def alpaca_headers() -> dict:
     """Headers básicos para cualquier llamada a Alpaca."""
     return {
@@ -35,7 +35,6 @@ def alpaca_headers() -> dict:
 # ---------------------------------
 # IMPORT DE ROUTERS
 # ---------------------------------
-
 from routes.test_alpaca import router as test_alpaca_router
 from routes.recommend import router as recommend_router
 from routes.signals import router as signals_router
@@ -52,7 +51,20 @@ from routes import pending_trades
 # ---------------------------------
 app = FastAPI(title="BDV API", version="0.1.0")
 
+# 🆕 ---------------------------------
+# Middleware CORS (para permitir conexión desde tu GPT)
+# ---------------------------------
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # permite cualquier origen (tu GPT)
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ---------------------------------
 # Incluir routers
+# ---------------------------------
 app.include_router(test_alpaca_router)
 app.include_router(recommend_router)
 app.include_router(signals_router)
@@ -75,7 +87,6 @@ def get_latest_trade(symbol: str) -> dict:
     r.raise_for_status()
     return r.json()
 
-
 # ---------------------------------
 # Endpoint /snapshot
 # ---------------------------------
@@ -91,20 +102,15 @@ def market_snapshot():
         for sym in symbols:
             raw = get_latest_trade(sym)
             trade = raw.get("trade", {}) or raw.get("trades", [{}])[0]
-
-            data[sym] = {
-                "price": trade.get("p"),
-                "time": trade.get("t"),
-            }
+            data[sym] = {"price": trade.get("p"), "time": trade.get("t")}
 
         return {"status": "ok", "data": data}
     except Exception as e:
         print(f"[ERR] /snapshot: {e}")
         raise HTTPException(status_code=500, detail=f"Error getting snapshot: {e}")
 
-
 # 🆕 ---------------------------------
-# NUEVO BLOQUE: Endpoint /recommend
+# Endpoint /recommend
 # ---------------------------------
 @app.get("/recommend")
 def recommend():
@@ -120,7 +126,7 @@ def recommend():
                 "bias": "neutral",
                 "suggestion": "wait",
                 "target": 622.91,
-                "stop": 622.91
+                "stop": 622.91,
             },
             {
                 "symbol": "SPY",
@@ -128,7 +134,7 @@ def recommend():
                 "bias": "neutral",
                 "suggestion": "wait",
                 "target": 684.28,
-                "stop": 684.28
+                "stop": 684.28,
             },
             {
                 "symbol": "NVDA",
@@ -136,15 +142,13 @@ def recommend():
                 "bias": "neutral",
                 "suggestion": "wait",
                 "target": 183.53,
-                "stop": 183.53
-            }
+                "stop": 183.53,
+            },
         ],
-        "note": "Basado en snapshot. Lógica simple; el GPT BDV aplica análisis y gestión de riesgo."
+        "note": "Basado en snapshot. Lógica simple; el GPT BDV aplica análisis y gestión de riesgo.",
     }
 
-    # 🔹 devolvemos JSON con encabezado correcto
     return JSONResponse(content=data)
-
 
 # ---------------------------------
 # Modelo para /trade
@@ -157,7 +161,6 @@ class TradeRequest(BaseModel):
     time_in_force: Literal["day", "gtc"] = "day"
     limit_price: Optional[float] = None
 
-
 # ---------------------------------
 # Log de trades en archivo local
 # ---------------------------------
@@ -168,9 +171,7 @@ def append_trade_log(entry: dict) -> None:
         with open(TRADES_LOG_FILE, "a", encoding="utf-8") as f:
             f.write(line + "\n")
     except Exception as e:
-        # No romper la API por fallo de log
         print(f"[WARN] No se pudo escribir en el log de trades: {e}")
-
 
 # ---------------------------------
 # Endpoint /trade  (ejecutar orden en Alpaca)
@@ -181,7 +182,6 @@ def place_trade(req: TradeRequest):
     Envía una orden a Alpaca y la registra en el log.
     """
     orders_url = f"{APCA_TRADING_URL}/orders"
-
     payload = {
         "symbol": req.symbol,
         "qty": req.qty,
@@ -237,7 +237,6 @@ def place_trade(req: TradeRequest):
         print(f"[ERR] /trade: {e}")
         raise HTTPException(status_code=500, detail=f"Unexpected error placing trade: {e}")
 
-
 # ---------------------------------
 # Endpoint /trades-log  (leer log)
 # ---------------------------------
@@ -261,10 +260,8 @@ def get_trades_log(limit: int = 10):
                 except Exception:
                     continue
 
-        # Solo las últimas N
         entries = entries[-limit:]
         return {"status": "ok", "log": entries}
-
     except Exception as e:
         print(f"[ERR] /trades-log: {e}")
         raise HTTPException(status_code=500, detail=f"Error reading trades log: {e}")
