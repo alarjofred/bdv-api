@@ -3,8 +3,24 @@ import requests
 import os
 import numpy as np
 from fastapi import APIRouter
+import json
+from datetime import datetime  # ✅ agregado para manejo de fecha y hora
 
 router = APIRouter(prefix="/analysis", tags=["analysis"])
+
+# ===============================
+#  LOG DE ANÁLISIS (nuevo bloque)
+# ===============================
+LOG_FILE = "analysis-log.jsonl"
+
+def append_analysis_log(entry: dict):
+    """Guarda el resultado de cada análisis en un archivo local .jsonl"""
+    try:
+        line = json.dumps(entry, ensure_ascii=False)
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception as e:
+        print(f"[WARN] No se pudo escribir el log de análisis: {e}")
 
 # ===============================
 #  CONFIGURACIÓN Y UTILIDADES
@@ -92,6 +108,21 @@ def get_market_bias(symbol: str):
         bias = "bearish"
         confidence = 0.7
 
+    # ✅ --- Guardar log histórico ---
+    log_entry = {
+        "timestamp": datetime.utcnow().isoformat(),
+        "symbol": symbol,
+        "price": round(price, 2),
+        "ema9": round(ema9, 2),
+        "ema20": round(ema20, 2),
+        "rsi": round(rsi, 2),
+        "volume_ratio": round(vol_ratio, 2),
+        "bias": bias,
+        "confidence": round(confidence, 2),
+    }
+    append_analysis_log(log_entry)
+
+    # --- Retorno normal del endpoint ---
     return {
         "symbol": symbol,
         "price": round(price, 2),
