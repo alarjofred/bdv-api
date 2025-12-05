@@ -182,3 +182,27 @@ def sync_analysis_data():
         "synced": synced_data,
         "note": "Datos listos para integración con Panel IA BDV"
     }
+
+# ===============================
+#  SINCRONIZACIÓN AUTOMÁTICA (AUTO-SYNC)
+# ===============================
+from fastapi_utils.tasks import repeat_every
+from fastapi import FastAPI
+
+def register_auto_sync(app: FastAPI):
+    """
+    Registra una tarea automática que actualiza QQQ, SPY y NVDA
+    cada 10 minutos para mantener /sync actualizado.
+    """
+    @app.on_event("startup")
+    @repeat_every(seconds=600)  # 10 minutos
+    def auto_sync_task() -> None:
+        symbols = ["QQQ", "SPY", "NVDA"]
+        print("[AUTO-SYNC] Iniciando actualización automática...")
+        for sym in symbols:
+            try:
+                get_market_bias(sym)
+                print(f"[AUTO-SYNC] ✅ {sym} actualizado correctamente")
+            except Exception as e:
+                print(f"[AUTO-SYNC] ⚠️ Error al actualizar {sym}: {e}")
+        print("[AUTO-SYNC] Finalizado.")
