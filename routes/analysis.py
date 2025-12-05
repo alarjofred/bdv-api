@@ -134,3 +134,28 @@ def get_market_bias(symbol: str):
         "bias": bias,
         "confidence": round(confidence, 2),
     }
+# ===============================
+#  ENDPOINT: HISTORIAL TEMPORAL
+# ===============================
+analysis_history = []  # 🧠 Memoria temporal de análisis
+
+@router.get("/history")
+def get_analysis_history(limit: int = 10):
+    """
+    Devuelve los últimos análisis guardados en memoria temporal.
+    No usa archivos físicos (ideal para Render).
+    """
+    # Devuelve los últimos 'limit' registros (por defecto 10)
+    return list(reversed(analysis_history[-limit:]))
+
+# --- Sobrescribimos append_analysis_log para guardar también en memoria ---
+def append_analysis_log(entry: dict):
+    """Guarda el resultado en lista temporal y (opcionalmente) en archivo local."""
+    try:
+        analysis_history.append(entry)  # 🧠 Guardado en memoria
+        # También intenta escribir localmente (opcional, sin romper nada)
+        line = json.dumps(entry, ensure_ascii=False)
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception as e:
+        print(f"[WARN] No se pudo escribir el log de análisis: {e}")
