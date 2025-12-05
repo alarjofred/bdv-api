@@ -195,15 +195,17 @@ def register_auto_sync(app: FastAPI):
     cada 1 minuto para mantener /sync actualizado.
     """
     @app.on_event("startup")
-   @repeat_every(seconds=60)  # ⏱️ cada 1 minuto
+    @repeat_every(seconds=60)  # ⏱️ cada 1 minuto
     def auto_sync_task() -> None:
         symbols = ["QQQ", "SPY", "NVDA"]
         print("[AUTO-SYNC] Iniciando actualización automática...")
+
         for sym in symbols:
             try:
                 get_market_bias(sym)
                 print(f"[AUTO-SYNC] ✅ {sym} actualizado correctamente")
             except Exception as e:
                 print(f"[AUTO-SYNC] ⚠️ Error al actualizar {sym}: {e}")
+
         print("[AUTO-SYNC] Finalizado.")
         print(f"[AUTO-SYNC] Última actualización completada a {datetime.utcnow().isoformat()}")
