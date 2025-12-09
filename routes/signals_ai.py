@@ -102,6 +102,28 @@ class OptionSignal(BaseModel):
 
 STRATEGY_LIBRARY = {
     # (... tu librería completa intacta ...)
+
+    "no_trade": {
+        "human_label": "Sin operación – contexto no favorable",
+        "time_frame": "5m",
+        "confidence": 0.0,
+        "structure": {
+            "kind": "none",
+            "direction": "none",
+            "legs": [],
+            "days_to_expiry": None,
+            "delta_hint": None,
+        },
+        "risk": {
+            "stop_loss_pct": None,
+            "take_profit_pct": None,
+            "trailing_from_pct": None,
+            "trailing_stop_pct": None,
+        },
+        "notes": [
+            "No se detectó una ventaja clara de trading en este momento. Mantenerse fuera del mercado."
+        ],
+    },
 }
 
 
