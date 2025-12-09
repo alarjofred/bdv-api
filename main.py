@@ -66,7 +66,6 @@ app.include_router(trade.router)
 app.include_router(telegram_notify.router)
 app.include_router(pending_trades.router)
 app.include_router(analysis.router)
-app.mount("/", StaticFiles(directory=".", html=True), name="static")
 
 # ---------------------------------
 # Función auxiliar: última cotización (bid/ask)
@@ -262,4 +261,5 @@ def get_trades_log(limit: int = 10):
 from routes.analysis import register_auto_sync
 register_auto_sync(app)
 
-
+# --- Static files (igual que antes, pero al final) ---
+app.mount("/", StaticFiles(directory=".", html=True), name="static")
