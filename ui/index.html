@@ -44,7 +44,7 @@
 
     #analysis {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
       gap: 15px;
       margin-top: 18px;
     }
@@ -52,17 +52,18 @@
     .card {
       background-color: #1e293b;
       padding: 15px;
-      border-radius: 12px;
-      box-shadow: 0 2px 6px rgba(0, 0, 0, 0.3);
+      border-radius: 14px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.28);
       transition: transform 0.2s ease;
+      border: 1px solid rgba(148,163,184,0.18);
     }
     .card:hover { transform: translateY(-4px); }
 
     .symbol {
       font-size: 18px;
-      font-weight: 700;
+      font-weight: 800;
       color: #38bdf8;
-      margin-bottom: 8px;
+      margin-bottom: 10px;
       display:flex;
       align-items:center;
       justify-content:space-between;
@@ -75,7 +76,8 @@
       border-radius: 999px;
       background: rgba(148,163,184,0.15);
       border: 1px solid rgba(148,163,184,0.25);
-      white-space: nowrap;
+      font-weight: 800;
+      letter-spacing: 0.3px;
     }
 
     .bullish { color: #22c55e; }
@@ -91,20 +93,20 @@
     }
     .row b { color:#e2e8f0; }
 
+    .divider {
+      height: 1px;
+      background: rgba(148,163,184,0.16);
+      margin: 10px 0;
+    }
+
     .error {
       color: #fecaca;
       background: rgba(239,68,68,0.12);
       border: 1px solid rgba(239,68,68,0.25);
       padding: 10px 12px;
       border-radius: 10px;
-    }
-
-    .ok {
-      color: #bbf7d0;
-      background: rgba(34,197,94,0.10);
-      border: 1px solid rgba(34,197,94,0.25);
-      padding: 10px 12px;
-      border-radius: 10px;
+      text-align:center;
+      grid-column: 1 / -1;
     }
 
     .btnRow{
@@ -112,6 +114,7 @@
       justify-content:center;
       gap:10px;
       margin-top: 10px;
+      flex-wrap: wrap;
     }
     button{
       cursor:pointer;
@@ -120,20 +123,19 @@
       color:#e2e8f0;
       padding: 8px 12px;
       border-radius: 10px;
-      font-weight: 600;
+      font-weight: 700;
     }
     button:hover{ background: rgba(56,189,248,0.18); }
 
-    .subtle {
-      opacity: .9;
+    .pill {
+      display:inline-block;
+      padding: 3px 8px;
+      border-radius: 999px;
+      border: 1px solid rgba(148,163,184,0.25);
+      background: rgba(148,163,184,0.12);
       font-size: 12px;
-      margin-top: 10px;
-    }
-
-    .divider {
-      height: 1px;
-      background: rgba(148,163,184,0.2);
-      margin: 10px 0;
+      font-weight: 700;
+      opacity: 0.9;
     }
   </style>
 </head>
@@ -143,10 +145,12 @@
 
   <div class="section">
     <div id="snapshotBox" class="snapshotBox">Cargando snapshot...</div>
-    <div class="muted">Snapshot (actualiza cada 15s) — *Si el mercado está cerrado, los quotes pueden estar estáticos*</div>
+    <div class="muted">
+      Snapshot (actualiza cada 15s) — <span class="pill">si el mercado está cerrado, los quotes pueden estar estáticos</span>
+    </div>
 
     <div class="btnRow">
-      <button onclick="manualRunAndRefresh()">Forzar análisis ahora</button>
+      <button onclick="manualRun()">Forzar análisis ahora</button>
       <button onclick="loadAll()">Refrescar todo</button>
     </div>
   </div>
@@ -157,9 +161,6 @@
   </div>
 
   <script>
-    // Cache local del snapshot para poder usar bid/ask dentro de cada tarjeta
-    let snapshotCache = {};
-
     function fmt(n) {
       if (n === null || n === undefined) return "—";
       const x = Number(n);
@@ -167,8 +168,18 @@
       return x.toFixed(2);
     }
 
+    // Cache local del último snapshot para poder pintarlo en cada card
+    let LAST_SNAPSHOT = null;   // { QQQ:{price,bid,ask,time}, ... }
+    let LAST_SNAPSHOT_RAW = null;
+
+    function pickSnap(symbol){
+      if (!LAST_SNAPSHOT) return null;
+      return LAST_SNAPSHOT[symbol] || null;
+    }
+
     function biasClass(bias) {
-      const b = String(bias || "neutral").toLowerCase();
+      if (!bias) return "neutral";
+      const b = String(bias).toLowerCase();
       if (b === "bullish") return "bullish";
       if (b === "bearish") return "bearish";
       return "neutral";
@@ -183,9 +194,10 @@
         const res = await fetch("/snapshot", { cache: "no-store" });
         if (!res.ok) throw new Error("HTTP " + res.status);
         const j = await res.json();
+        LAST_SNAPSHOT_RAW = j;
 
         const d = j.data || {};
-        snapshotCache = d || {};
+        LAST_SNAPSHOT = d;
 
         const qqq = d.QQQ || {};
         const spy = d.SPY || {};
@@ -200,69 +212,85 @@
           `     time : ${nvda.time || "—"}`;
       } catch (e) {
         box.textContent = "Error leyendo /snapshot: " + e.message;
+        LAST_SNAPSHOT = null;
+        LAST_SNAPSHOT_RAW = null;
       }
     }
 
     // -----------------------------
     // ANALYSIS
-    // Fuente correcta: /analysis/sync  (devuelve {status, count, synced:[...]})
     // -----------------------------
+    async function runAnalysisBackend(){
+      // Preferimos /analysis/run porque SI genera data (tu backend ya lo tiene).
+      // Si no existe, cae a /analysis/sync.
+      try {
+        const r = await fetch("/analysis/run", { cache: "no-store" });
+        if (r.ok) return r;
+      } catch (e) {}
+      // fallback
+      return fetch("/analysis/sync", { cache: "no-store" });
+    }
+
     async function loadAnalysis() {
       const container = document.getElementById("analysis");
       try {
-        const res = await fetch("/analysis/sync", { cache: "no-store" });
-        if (!res.ok) throw new Error("HTTP " + res.status);
-        const j = await res.json();
+        // 1) dispara análisis real
+        await runAnalysisBackend();
 
-        // si no hay data todavía
-        if (!j || j.status !== "ok" || !Array.isArray(j.synced) || j.synced.length === 0) {
-          container.innerHTML = `<div class="error">No hay datos de análisis aún. Ejecuta “Forzar análisis ahora”.</div>`;
+        // 2) lee el sync ya listo para UI
+        const r2 = await fetch("/analysis/sync", { cache: "no-store" });
+        if (!r2.ok) throw new Error("HTTP " + r2.status);
+        const data = await r2.json();
+
+        const items = data.synced || [];
+        container.innerHTML = "";
+
+        if (!items || items.length === 0) {
+          container.innerHTML = `<div class="error">No hay datos de análisis aún. Pulsa “Forzar análisis ahora”.</div>`;
           return;
         }
 
-        // Orden por símbolo
-        const items = [...j.synced].sort((a,b) => String(a.symbol).localeCompare(String(b.symbol)));
-
-        container.innerHTML = "";
+        // Orden estable por símbolo
+        items.sort((a,b) => String(a.symbol).localeCompare(String(b.symbol)));
 
         items.forEach((item) => {
-          const sym = item.symbol || "—";
-          const cls = biasClass(item.bias);
-
-          // Traer bid/ask/time del snapshotCache (si existe)
-          const snap = snapshotCache[sym] || {};
-          const bid = fmt(snap.bid);
-          const ask = fmt(snap.ask);
-          const qtime = snap.time || "—";
-          const qprice = fmt(snap.price);
-
-          const confPct =
-            (item.confidence !== undefined && item.confidence !== null)
-              ? (Number(item.confidence) * 100).toFixed(0) + "%"
-              : "—";
-
+          const sym = (item.symbol || "—").toUpperCase();
           const div = document.createElement("div");
           div.classList.add("card");
+
+          const cls = biasClass(item.bias);
+          const confPct = (item.confidence !== undefined && item.confidence !== null)
+            ? (Number(item.confidence) * 100).toFixed(0) + "%"
+            : "—";
+
+          // Merge snapshot por símbolo
+          const snap = pickSnap(sym) || {};
+          const quotePrice = snap.price;
+          const quoteBid   = snap.bid;
+          const quoteAsk   = snap.ask;
+          const quoteTime  = snap.time;
 
           div.innerHTML = `
             <div class="symbol">
               <span>${sym}</span>
-              <span class="badge ${cls}">${String(item.bias || "neutral").toUpperCase()}</span>
+              <span class="badge ${cls}">${(item.bias || "neutral").toUpperCase()}</span>
             </div>
 
             <div class="row"><span>💰 Precio (análisis)</span><b>${fmt(item.price)}</b></div>
             <div class="row"><span>📈 EMA9 / EMA20</span><b>${fmt(item.ema9)} / ${fmt(item.ema20)}</b></div>
             <div class="row"><span>📊 RSI</span><b>${fmt(item.rsi)}</b></div>
-            <div class="row"><span>📦 Vol ratio</span><b>${item.volume_ratio ?? "—"}</b></div>
+            <div class="row"><span>📦 Vol ratio</span><b>${(item.volume_ratio ?? "—")}</b></div>
             <div class="row"><span>🔹 Confianza</span><b>${confPct}</b></div>
 
             <div class="divider"></div>
 
-            <div class="row"><span>📨 Quote (snapshot)</span><b>${qprice}</b></div>
-            <div class="row"><span>🟩 Bid / Ask</span><b>${bid} / ${ask}</b></div>
+            <div class="row"><span>🧾 Quote (snapshot)</span><b>${fmt(quotePrice)}</b></div>
+            <div class="row"><span>🟩 Bid / Ask</span><b>${fmt(quoteBid)} / ${fmt(quoteAsk)}</b></div>
 
-            <div class="subtle">🕒 Quote time: ${qtime}</div>
-            <div class="subtle">⏱ Analysis time: ${item.timestamp ? new Date(item.timestamp).toLocaleString() : "—"}</div>
+            <div class="muted" style="text-align:left;margin-top:10px;">
+              ⏱ Quote time: ${quoteTime || "—"}<br/>
+              ⏱ Analysis time: ${item.timestamp ? new Date(item.timestamp).toLocaleString() : "—"}
+            </div>
           `;
 
           container.appendChild(div);
@@ -274,27 +302,17 @@
       }
     }
 
-    // -----------------------------
-    // BOTÓN: Forzar análisis
-    // Tu servidor (según screenshot) tiene /analysis/run (GET) que genera 3 resultados.
-    // Si falla, igual refrescamos.
-    // -----------------------------
-    async function manualRunAndRefresh() {
-      try {
-        await fetch("/analysis/run", { cache: "no-store" }); // si existe, dispara cálculo
-      } catch (e) {
-        // si no existe, no pasa nada
-      }
+    async function manualRun(){
       await loadSnapshot();
       await loadAnalysis();
     }
 
-    async function loadAll() {
+    async function loadAll(){
       await loadSnapshot();
       await loadAnalysis();
     }
 
-    // Inicial
+    // Arranque
     loadAll();
 
     // Snapshot cada 15s
