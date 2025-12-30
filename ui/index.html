@@ -4,41 +4,49 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Panel IA BDV - Análisis en Vivo</title>
-
   <style>
     body {
       background-color: #0f172a;
       color: #e2e8f0;
       font-family: "Segoe UI", Arial, sans-serif;
       padding: 20px;
-      margin: 0;
     }
-
     h1 {
       text-align: center;
       color: #38bdf8;
       margin-bottom: 10px;
     }
 
-    /* SNAPSHOT */
-    #snapshotBox {
-      background-color: #020617;
-      border: 1px solid #1e293b;
-      border-radius: 14px;
-      padding: 16px;
-      max-width: 700px;
-      margin: 0 auto 25px auto;
-      font-family: monospace;
-      font-size: 15px;
-      white-space: pre-wrap;
+    .section {
+      max-width: 1000px;
+      margin: 0 auto 18px auto;
     }
 
-    /* ANALYSIS GRID */
+    .snapshotBox {
+      background-color: #0b1220;
+      border: 1px solid rgba(56,189,248,0.25);
+      padding: 14px 16px;
+      border-radius: 12px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.25);
+      white-space: pre;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      font-size: 13px;
+      line-height: 1.3;
+      overflow-x: auto;
+    }
+
+    .muted {
+      opacity: 0.75;
+      font-size: 12px;
+      text-align: center;
+      margin-top: 8px;
+    }
+
     #analysis {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
       gap: 15px;
-      margin-top: 10px;
+      margin-top: 18px;
     }
 
     .card {
@@ -48,128 +56,217 @@
       box-shadow: 0 2px 6px rgba(0, 0, 0, 0.3);
       transition: transform 0.2s ease;
     }
-
     .card:hover {
-      transform: translateY(-5px);
+      transform: translateY(-4px);
     }
 
     .symbol {
-      font-size: 20px;
-      font-weight: bold;
+      font-size: 18px;
+      font-weight: 700;
       color: #38bdf8;
       margin-bottom: 8px;
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:10px;
     }
 
-    .bullish {
-      color: #22c55e;
+    .badge {
+      font-size: 12px;
+      padding: 3px 8px;
+      border-radius: 999px;
+      background: rgba(148,163,184,0.15);
+      border: 1px solid rgba(148,163,184,0.25);
     }
 
-    .bearish {
-      color: #ef4444;
+    .bullish { color: #22c55e; }
+    .bearish { color: #ef4444; }
+    .neutral { color: #eab308; }
+
+    .row {
+      display:flex;
+      justify-content:space-between;
+      gap:10px;
+      margin: 6px 0;
+      font-size: 14px;
+    }
+    .row b { color:#e2e8f0; }
+
+    .error {
+      color: #fecaca;
+      background: rgba(239,68,68,0.12);
+      border: 1px solid rgba(239,68,68,0.25);
+      padding: 10px 12px;
+      border-radius: 10px;
     }
 
-    .neutral {
-      color: #eab308;
+    .btnRow{
+      display:flex;
+      justify-content:center;
+      gap:10px;
+      margin-top: 10px;
     }
-
-    .muted {
-      opacity: 0.7;
-      font-size: 13px;
-      text-align: center;
-      margin-top: 6px;
+    button{
+      cursor:pointer;
+      border: 1px solid rgba(56,189,248,0.35);
+      background: rgba(56,189,248,0.12);
+      color:#e2e8f0;
+      padding: 8px 12px;
+      border-radius: 10px;
+      font-weight: 600;
     }
+    button:hover{ background: rgba(56,189,248,0.18); }
   </style>
 </head>
 
 <body>
   <h1>📊 Panel IA BDV — Estado del Mercado</h1>
 
-  <!-- SNAPSHOT EN VIVO -->
-  <div id="snapshotBox">Cargando snapshot...</div>
-  <div class="muted">Snapshot en vivo (actualiza cada 15s)</div>
+  <div class="section">
+    <div id="snapshotBox" class="snapshotBox">Cargando snapshot...</div>
+    <div class="muted">Snapshot en vivo (actualiza cada 15s)</div>
 
-  <!-- ANALYSIS IA -->
-  <div id="analysis">Cargando análisis IA...</div>
+    <div class="btnRow">
+      <button onclick="manualSync()">Forzar análisis ahora</button>
+      <button onclick="loadAll()">Refrescar todo</button>
+    </div>
+  </div>
+
+  <div class="section">
+    <div id="analysis">Cargando análisis...</div>
+    <div class="muted">Análisis (actualiza cada 60s)</div>
+  </div>
 
   <script>
-    /* ===========================
-       SNAPSHOT
-    =========================== */
+    function fmt(n) {
+      if (n === null || n === undefined) return "—";
+      const x = Number(n);
+      if (Number.isNaN(x)) return String(n);
+      return x.toFixed(2);
+    }
+
+    // -----------------------------
+    // SNAPSHOT
+    // -----------------------------
     async function loadSnapshot() {
-      const el = document.getElementById("snapshotBox");
+      const box = document.getElementById("snapshotBox");
       try {
         const res = await fetch("/snapshot", { cache: "no-store" });
         if (!res.ok) throw new Error("HTTP " + res.status);
-
         const j = await res.json();
+
         const d = j.data || {};
+        const qqq = d.QQQ || {};
+        const spy = d.SPY || {};
+        const nvda = d.NVDA || {};
 
-        const fmt = (v) =>
-          v === undefined || v === null ? "-" : v;
-
-        el.textContent =
-          `QQQ  price: ${fmt(d.QQQ?.price)}   bid: ${fmt(d.QQQ?.bid)}   ask: ${fmt(d.QQQ?.ask)}\n` +
-          `     time : ${fmt(d.QQQ?.time)}\n\n` +
-          `SPY  price: ${fmt(d.SPY?.price)}   bid: ${fmt(d.SPY?.bid)}   ask: ${fmt(d.SPY?.ask)}\n` +
-          `     time : ${fmt(d.SPY?.time)}\n\n` +
-          `NVDA price: ${fmt(d.NVDA?.price)}   bid: ${fmt(d.NVDA?.bid)}   ask: ${fmt(d.NVDA?.ask)}\n` +
-          `     time : ${fmt(d.NVDA?.time)}`;
+        box.textContent =
+          `QQQ  price: ${fmt(qqq.price)}  bid: ${fmt(qqq.bid)}  ask: ${fmt(qqq.ask)}\n` +
+          `     time : ${qqq.time || "—"}\n\n` +
+          `SPY  price: ${fmt(spy.price)}  bid: ${fmt(spy.bid)}  ask: ${fmt(spy.ask)}\n` +
+          `     time : ${spy.time || "—"}\n\n` +
+          `NVDA price: ${fmt(nvda.price)}  bid: ${fmt(nvda.bid)}  ask: ${fmt(nvda.ask)}\n` +
+          `     time : ${nvda.time || "—"}`;
       } catch (e) {
-        el.textContent = "Error leyendo /snapshot: " + e.message;
+        box.textContent = "Error leyendo /snapshot: " + e.message;
       }
     }
 
-    loadSnapshot();
-    setInterval(loadSnapshot, 15000);
+    // -----------------------------
+    // ANALYSIS
+    // Strategy:
+    // 1) Llamar /analysis/sync para generar data en backend
+    // 2) Leer /analysis/history y pintar
+    // -----------------------------
+    async function syncAnalysis() {
+      // Si el backend todavía no genera análisis, aquí verás "empty".
+      const res = await fetch("/analysis/sync", { cache: "no-store" });
+      // no forzamos error aquí; solo queremos disparar el proceso
+      return res;
+    }
 
-    /* ===========================
-       ANALYSIS IA
-    =========================== */
+    function biasClass(bias) {
+      if (!bias) return "neutral";
+      const b = String(bias).toLowerCase();
+      if (b === "bullish") return "bullish";
+      if (b === "bearish") return "bearish";
+      return "neutral";
+    }
+
     async function loadAnalysis() {
+      const container = document.getElementById("analysis");
       try {
-        const response = await fetch("/analysis/sync", { cache: "no-store" });
-        const data = await response.json();
+        // 1) dispara sync (genera data)
+        await syncAnalysis();
 
-        const container = document.getElementById("analysis");
+        // 2) lee history
+        const r2 = await fetch("/analysis/history?limit=10", { cache: "no-store" });
+        if (!r2.ok) throw new Error("HTTP " + r2.status);
+        const data = await r2.json();
+
+        const items = data.items || data.synced || data.history || [];
         container.innerHTML = "";
 
-        if (!data.synced || data.synced.length === 0) {
-          container.innerHTML = "<p>No hay datos disponibles aún.</p>";
+        if (!items || items.length === 0) {
+          container.innerHTML = `<div class="error">No hay datos de análisis aún. Ejecuta “Forzar análisis ahora”.</div>`;
           return;
         }
 
-        data.synced.forEach((item) => {
+        // si vienen mezclados, ordena por timestamp desc
+        items.sort((a,b) => (new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()));
+
+        items.forEach((item) => {
           const div = document.createElement("div");
           div.classList.add("card");
 
-          const biasClass =
-            item.bias === "bullish"
-              ? "bullish"
-              : item.bias === "bearish"
-              ? "bearish"
-              : "neutral";
+          const cls = biasClass(item.bias);
+          const confPct = (item.confidence !== undefined && item.confidence !== null)
+            ? (Number(item.confidence) * 100).toFixed(0) + "%"
+            : "—";
 
           div.innerHTML = `
-            <div class="symbol">${item.symbol}</div>
-            <p>💰 Precio: <b>${item.price}</b></p>
-            <p>📈 EMA9: ${item.ema9} | EMA20: ${item.ema20}</p>
-            <p>📊 RSI: ${item.rsi}</p>
-            <p>📦 Volumen Relativo: ${item.volume_ratio}</p>
-            <p>🧭 Bias: <b class="${biasClass}">${item.bias.toUpperCase()}</b></p>
-            <p>🔹 Confianza: ${(item.confidence * 100).toFixed(0)}%</p>
-            <small>⏱ ${new Date(item.timestamp).toLocaleString()}</small>
+            <div class="symbol">
+              <span>${item.symbol || "—"}</span>
+              <span class="badge ${cls}">${(item.bias || "neutral").toUpperCase()}</span>
+            </div>
+
+            <div class="row"><span>💰 Precio</span><b>${fmt(item.price)}</b></div>
+            <div class="row"><span>📈 EMA9 / EMA20</span><b>${fmt(item.ema9)} / ${fmt(item.ema20)}</b></div>
+            <div class="row"><span>📊 RSI</span><b>${fmt(item.rsi)}</b></div>
+            <div class="row"><span>📦 Vol ratio</span><b>${item.volume_ratio ?? "—"}</b></div>
+            <div class="row"><span>🔹 Confianza</span><b>${confPct}</b></div>
+
+            <div class="muted" style="text-align:left;margin-top:10px;">
+              ⏱ ${item.timestamp ? new Date(item.timestamp).toLocaleString() : "—"}
+            </div>
           `;
           container.appendChild(div);
         });
+
       } catch (error) {
         console.error("Error cargando análisis:", error);
-        document.getElementById("analysis").innerHTML =
-          "<p>Error al conectar con el servidor.</p>";
+        container.innerHTML = `<div class="error">Error al conectar con analysis: ${error.message}</div>`;
       }
     }
 
-    loadAnalysis();
-    setInterval(loadAnalysis, 5 * 60 * 1000);
+    async function manualSync(){
+      // fuerza sync + refresca
+      await loadAnalysis();
+    }
+
+    async function loadAll(){
+      await loadSnapshot();
+      await loadAnalysis();
+    }
+
+    // Cargar inmediatamente
+    loadAll();
+
+    // Snapshot cada 15s
+    setInterval(loadSnapshot, 15000);
+
+    // Analysis cada 60s
+    setInterval(loadAnalysis, 60000);
   </script>
 </body>
 </html>
