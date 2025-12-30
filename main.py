@@ -52,6 +52,12 @@ from routes import analysis
 # ---------------------------------
 app = FastAPI(title="BDV API", version="0.1.0")
 
+# ✅ IMPORTANTE: Healthcheck en "/"
+# Esto evita que Actions/Render piense que el server "no existe"
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "bdv-api", "message": "alive"}
+
 # ---------------------------------
 # Incluir routers
 # ---------------------------------
@@ -100,7 +106,6 @@ def market_snapshot():
         print(f"[ERR] /snapshot: {e}")
         raise HTTPException(status_code=500, detail=f"Error getting snapshot: {e}")
 
-
 # ---------------------------------
 # Endpoint /recommend
 # ---------------------------------
@@ -139,7 +144,6 @@ def recommend():
         ],
         "note": "Basado en snapshot. Lógica simple; el GPT BDV aplica análisis y gestión de riesgo.",
     }
-
     return JSONResponse(content=data)
 
 # ---------------------------------
@@ -261,5 +265,7 @@ def get_trades_log(limit: int = 10):
 from routes.analysis import register_auto_sync
 register_auto_sync(app)
 
-# --- Static files (igual que antes, pero al final) ---
-app.mount("/", StaticFiles(directory=".", html=True), name="static")
+# ✅ CAMBIO CLAVE:
+# No montes static en "/" porque rompe el root y confunde Actions.
+# Monta el panel/UI en /ui
+app.mount("/ui", StaticFiles(directory=".", html=True), name="static")
