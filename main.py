@@ -48,15 +48,29 @@ from routes import pending_trades
 from routes import analysis
 
 # ---------------------------------
-# Inicializar FastAPI
+# Inicializar FastAPI  ✅ (CORREGIDO Render + Actions)
 # ---------------------------------
-app = FastAPI(title="BDV API", version="0.1.0")
+app = FastAPI(
+    title="BDV API",
+    version="0.1.0",
+    servers=[
+        {
+            "url": "https://bdv-api-server.onrender.com",
+            "description": "Render production"
+        }
+    ]
+)
 
 # ✅ IMPORTANTE: Healthcheck en "/"
 # Esto evita que Actions/Render piense que el server "no existe"
 @app.get("/")
 def root():
     return {"status": "ok", "service": "bdv-api", "message": "alive"}
+
+# ✅ Healthcheck extra (muchos validadores lo usan)
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
 # ---------------------------------
 # Incluir routers
@@ -266,8 +280,7 @@ from routes.analysis import register_auto_sync
 register_auto_sync(app)
 
 # ✅ CAMBIO CLAVE:
-# No montes static en "/" porque rompe el root y confunde Actions.
-# Monta el panel/UI en /ui
-app.mount("/ui", StaticFiles(directory=".", html=True), name="static")
-
-
+# NO uses StaticFiles(directory=".")
+# Crea carpeta "ui/" y pon tu index.html o panel.html allí.
+# Ej: ui/index.html
+app.mount("/ui", StaticFiles(directory="ui", html=True), name="ui")
