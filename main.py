@@ -269,3 +269,5 @@ register_auto_sync(app)
 # No montes static en "/" porque rompe el root y confunde Actions.
 # Monta el panel/UI en /ui
 app.mount("/ui", StaticFiles(directory=".", html=True), name="static")
+
+
