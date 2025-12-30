@@ -4,23 +4,43 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Panel IA BDV - Análisis en Vivo</title>
+
   <style>
     body {
       background-color: #0f172a;
       color: #e2e8f0;
       font-family: "Segoe UI", Arial, sans-serif;
       padding: 20px;
+      margin: 0;
     }
+
     h1 {
       text-align: center;
       color: #38bdf8;
+      margin-bottom: 10px;
     }
+
+    /* SNAPSHOT */
+    #snapshotBox {
+      background-color: #020617;
+      border: 1px solid #1e293b;
+      border-radius: 14px;
+      padding: 16px;
+      max-width: 700px;
+      margin: 0 auto 25px auto;
+      font-family: monospace;
+      font-size: 15px;
+      white-space: pre-wrap;
+    }
+
+    /* ANALYSIS GRID */
     #analysis {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
       gap: 15px;
-      margin-top: 20px;
+      margin-top: 10px;
     }
+
     .card {
       background-color: #1e293b;
       padding: 15px;
@@ -28,34 +48,86 @@
       box-shadow: 0 2px 6px rgba(0, 0, 0, 0.3);
       transition: transform 0.2s ease;
     }
+
     .card:hover {
       transform: translateY(-5px);
     }
+
     .symbol {
       font-size: 20px;
       font-weight: bold;
       color: #38bdf8;
       margin-bottom: 8px;
     }
+
     .bullish {
       color: #22c55e;
     }
+
     .bearish {
       color: #ef4444;
     }
+
     .neutral {
       color: #eab308;
     }
+
+    .muted {
+      opacity: 0.7;
+      font-size: 13px;
+      text-align: center;
+      margin-top: 6px;
+    }
   </style>
 </head>
+
 <body>
   <h1>📊 Panel IA BDV — Estado del Mercado</h1>
-  <div id="analysis">Cargando análisis...</div>
+
+  <!-- SNAPSHOT EN VIVO -->
+  <div id="snapshotBox">Cargando snapshot...</div>
+  <div class="muted">Snapshot en vivo (actualiza cada 15s)</div>
+
+  <!-- ANALYSIS IA -->
+  <div id="analysis">Cargando análisis IA...</div>
 
   <script>
+    /* ===========================
+       SNAPSHOT
+    =========================== */
+    async function loadSnapshot() {
+      const el = document.getElementById("snapshotBox");
+      try {
+        const res = await fetch("/snapshot", { cache: "no-store" });
+        if (!res.ok) throw new Error("HTTP " + res.status);
+
+        const j = await res.json();
+        const d = j.data || {};
+
+        const fmt = (v) =>
+          v === undefined || v === null ? "-" : v;
+
+        el.textContent =
+          `QQQ  price: ${fmt(d.QQQ?.price)}   bid: ${fmt(d.QQQ?.bid)}   ask: ${fmt(d.QQQ?.ask)}\n` +
+          `     time : ${fmt(d.QQQ?.time)}\n\n` +
+          `SPY  price: ${fmt(d.SPY?.price)}   bid: ${fmt(d.SPY?.bid)}   ask: ${fmt(d.SPY?.ask)}\n` +
+          `     time : ${fmt(d.SPY?.time)}\n\n` +
+          `NVDA price: ${fmt(d.NVDA?.price)}   bid: ${fmt(d.NVDA?.bid)}   ask: ${fmt(d.NVDA?.ask)}\n` +
+          `     time : ${fmt(d.NVDA?.time)}`;
+      } catch (e) {
+        el.textContent = "Error leyendo /snapshot: " + e.message;
+      }
+    }
+
+    loadSnapshot();
+    setInterval(loadSnapshot, 15000);
+
+    /* ===========================
+       ANALYSIS IA
+    =========================== */
     async function loadAnalysis() {
       try {
-        const response = await fetch("https://bdv-api-server.onrender.com/analysis/sync");
+        const response = await fetch("/analysis/sync", { cache: "no-store" });
         const data = await response.json();
 
         const container = document.getElementById("analysis");
@@ -96,10 +168,7 @@
       }
     }
 
-    // Cargar inmediatamente
     loadAnalysis();
-
-    // Actualizar cada 5 minutos
     setInterval(loadAnalysis, 5 * 60 * 1000);
   </script>
 </body>
