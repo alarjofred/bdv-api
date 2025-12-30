@@ -1,12 +1,20 @@
 # routes/analysis.py
 import os
 import json
+from datetime import datetime, timedelta, timezone
+
 import requests
 import numpy as np
-from datetime import datetime
-from fastapi import APIRouter
-from fastapi import FastAPI
+from fastapi import APIRouter, HTTPException
 from fastapi_utils.tasks import repeat_every
+from fastapi import FastAPI
+
+try:
+    # opcional para local; en Render usarás env vars
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 
 router = APIRouter(prefix="/analysis", tags=["analysis"])
 
@@ -16,21 +24,23 @@ router = APIRouter(prefix="/analysis", tags=["analysis"])
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(BASE_DIR, "analysis-log.jsonl")
 
-# 🧠 Memoria temporal (Render no garantiza persistencia de disco entre reinicios)
-analysis_history = []
-
+analysis_history = []  # memoria en runtime (Render no persiste disco)
 
 def append_analysis_log(entry: dict):
     """Guarda el resultado en memoria y opcionalmente en archivo local."""
     try:
         analysis_history.append(entry)
 
+        # Evitar crecimiento infinito
+        if len(analysis_history) > 5000:
+            analysis_history[:] = analysis_history[-2000:]
+
+        # Guardar también en archivo local (best-effort)
         line = json.dumps(entry, ensure_ascii=False)
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(line + "\n")
     except Exception as e:
         print(f"[WARN] No se pudo escribir el log de análisis: {e}")
-
 
 # ===============================
 #  CONFIGURACIÓN ALPACA
@@ -39,56 +49,46 @@ APCA_API_KEY_ID = os.getenv("APCA_API_KEY_ID")
 APCA_API_SECRET_KEY = os.getenv("APCA_API_SECRET_KEY")
 APCA_DATA_URL = os.getenv("APCA_DATA_URL", "https://data.alpaca.markets/v2")
 
-# ✅ CLAVE: FEED correcto para BARS (en cuentas sin SIP, usa IEX)
-APCA_DATA_FEED = os.getenv("APCA_DATA_FEED", "iex")  # "iex" recomendado
-
+# ✅ IMPORTANTE PARA CUENTAS FREE:
+# IEX suele ser el feed permitido. SIP puede devolverte vacío/denegado.
+APCA_DATA_FEED = os.getenv("APCA_DATA_FEED", "iex")  # "iex" o "sip"
 
 def alpaca_headers():
+    if not APCA_API_KEY_ID or not APCA_API_SECRET_KEY:
+        # No rompas el server completo: devuelve error cuando se use analysis
+        return None
     return {
         "APCA-API-KEY-ID": APCA_API_KEY_ID,
         "APCA-API-SECRET-KEY": APCA_API_SECRET_KEY,
         "Accept": "application/json",
     }
 
-
 # ===============================
-#  FUNCIONES TÉCNICAS
+#  INDICADORES
 # ===============================
 def ema(values, period=20):
-    """Calcula EMA simple."""
-    values = np.array(values, dtype=float)
-    if len(values) == 0:
-        return 0.0
     if len(values) < period:
         return float(np.mean(values))
-
     weights = np.exp(np.linspace(-1.0, 0.0, period))
     weights /= weights.sum()
     a = np.convolve(values, weights, mode="full")[: len(values)]
     a[:period] = a[period]
     return float(a[-1])
 
-
 def calc_rsi(closes, period=14):
-    """RSI manual."""
-    closes = np.array(closes, dtype=float)
-    if len(closes) < period + 1:
+    closes = np.asarray(closes, dtype=float)
+    if len(closes) < period + 2:
         return 50.0
-
     deltas = np.diff(closes)
     seed = deltas[:period]
     up = seed[seed >= 0].sum() / period
-    down = (-seed[seed < 0]).sum() / period
-
-    if down == 0:
-        return 100.0
-
-    rs = up / down
-    rsi = 100 - (100 / (1 + rs))
+    down = -seed[seed < 0].sum() / period
+    rs = up / down if down != 0 else 0
+    rsi = 100 - (100 / (1 + rs)) if down != 0 else 100.0
 
     for delta in deltas[period:]:
-        upval = delta if delta > 0 else 0.0
-        downval = -delta if delta < 0 else 0.0
+        upval = delta if delta > 0 else 0
+        downval = -delta if delta < 0 else 0
         up = (up * (period - 1) + upval) / period
         down = (down * (period - 1) + downval) / period
         rs = up / down if down != 0 else 0
@@ -96,67 +96,89 @@ def calc_rsi(closes, period=14):
 
     return float(rsi)
 
+# ===============================
+#  ALPACA BARS (ROBUSTO)
+# ===============================
+def fetch_bars(symbol: str, timeframe: str = "5Min", limit: int = 200):
+    headers = alpaca_headers()
+    if headers is None:
+        raise HTTPException(status_code=500, detail="Faltan APCA_API_KEY_ID / APCA_API_SECRET_KEY en el entorno.")
 
-def _fetch_bars(symbol: str, timeframe: str = "5Min", limit: int = 100) -> list:
-    """
-    Trae barras desde Alpaca.
-    ✅ Incluye feed=iex por defecto para evitar 'bars: []' en cuentas sin SIP.
-    """
+    # ✅ para evitar respuestas vacías cuando el mercado está “raro”:
+    # pedimos desde hace ~3 días
+    now = datetime.now(timezone.utc)
+    start = (now - timedelta(days=3)).isoformat()
+
     url = f"{APCA_DATA_URL}/stocks/{symbol}/bars"
     params = {
         "timeframe": timeframe,
         "limit": limit,
         "adjustment": "raw",
         "feed": APCA_DATA_FEED,
+        "start": start,
     }
 
-    r = requests.get(url, headers=alpaca_headers(), params=params, timeout=10)
+    r = requests.get(url, headers=headers, params=params, timeout=15)
+    # Debug útil si algo falla:
+    print(f"[DBG] bars {symbol} => {r.status_code} url={r.url}")
 
-    # Debug útil en logs de Render
-    print(f"[DBG] bars {symbol} {timeframe} status={r.status_code} body={r.text[:200]}")
+    if r.status_code >= 400:
+        # no escondas el error (sirve para diagnosticar feed/permiso)
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "Error consultando bars en Alpaca",
+                "status": r.status_code,
+                "body": r.text[:500],
+                "url": r.url,
+            },
+        )
 
-    r.raise_for_status()
-    data = r.json() or {}
-    return data.get("bars", []) or []
+    j = r.json()
 
+    # Alpaca normalmente: {"bars":[...]}
+    bars = j.get("bars")
+
+    # A veces puede venir distinto; deja fallback:
+    if bars is None:
+        # algunos SDK/devuelven key distinta
+        bars = j.get("bar") or j.get("data") or []
+
+    # Si por cualquier razón llega como dict, conviértelo a lista:
+    # ej: {"bars":{"QQQ":[...]}} (cuando se pide multi-symbol en otros endpoints)
+    if isinstance(bars, dict):
+        bars = bars.get(symbol) or bars.get(symbol.upper()) or []
+
+    if not isinstance(bars, list):
+        bars = []
+
+    return bars
 
 # ===============================
-#  ENDPOINT PRINCIPAL: BIAS
+#  CORE: CALCULAR BIAS (SIN DEPENDER DEL ROUTE)
 # ===============================
-@router.get("/bias/{symbol}")
-def get_market_bias(symbol: str):
-    """
-    Evalúa tendencia, momentum y fuerza usando EMA9, EMA20, RSI y volumen.
-    Devuelve bias (bullish/bearish/neutral) con confianza.
-    """
-    symbol = symbol.upper().strip()
-
-    # 1) Intento intradía 5Min
-    bars = _fetch_bars(symbol, timeframe="5Min", limit=120)
-
-    # 2) Si está fuera de horario o no hay data, usa 1Day como fallback
-    if not bars:
-        bars = _fetch_bars(symbol, timeframe="1Day", limit=60)
+def compute_market_bias(symbol: str) -> dict:
+    bars = fetch_bars(symbol, timeframe="5Min", limit=200)
 
     if not bars:
-        return {"symbol": symbol, "bias": "neutral", "note": "No se recibieron datos (bars vacíos)"}
+        # Aquí está tu caso actual
+        return {"symbol": symbol, "bias": "neutral", "note": "No se recibieron datos (bars vacío). Revisa feed/mercado."}
 
     closes = np.array([b.get("c") for b in bars if b.get("c") is not None], dtype=float)
-    volumes = np.array([b.get("v", 0) for b in bars], dtype=float)
+    volumes = np.array([b.get("v") for b in bars if b.get("v") is not None], dtype=float)
 
-    if len(closes) < 30:
-        return {"symbol": symbol, "bias": "neutral", "note": "Datos insuficientes"}
+    if len(closes) < 30 or len(volumes) < 30:
+        return {"symbol": symbol, "bias": "neutral", "note": "Datos insuficientes (menos de 30 barras)."}
 
     ema9 = ema(closes, 9)
     ema20 = ema(closes, 20)
-    rsi = calc_rsi(closes)
+    rsi = calc_rsi(closes, 14)
+
+    vol_base = float(np.mean(volumes[-20:])) if len(volumes) >= 20 else float(np.mean(volumes))
+    vol_ratio = float(volumes[-1] / vol_base) if vol_base > 0 else 1.0
     price = float(closes[-1])
 
-    # volumen relativo (si no hay volumen útil, cae a 1.0)
-    vol_base = float(np.mean(volumes[-20:])) if len(volumes) >= 20 else float(np.mean(volumes))
-    vol_ratio = float(volumes[-1] / vol_base) if vol_base and vol_base != 0 else 1.0
-
-    # --- Score simple ---
+    # Scoring simple (tu lógica)
     score = 0
     if price > ema9 > ema20:
         score += 1
@@ -170,37 +192,58 @@ def get_market_bias(symbol: str):
         confidence = min(0.5 + score * 0.2, 1.0)
     elif score == 1:
         bias = "neutral"
-        confidence = 0.45
+        confidence = 0.4
     else:
         bias = "bearish"
         confidence = 0.7
 
     log_entry = {
         "timestamp": datetime.utcnow().isoformat(),
-        "symbol": symbol,
+        "symbol": symbol.upper(),
         "price": round(price, 2),
         "ema9": round(ema9, 2),
         "ema20": round(ema20, 2),
         "rsi": round(rsi, 2),
         "volume_ratio": round(vol_ratio, 2),
         "bias": bias,
-        "confidence": round(float(confidence), 2),
+        "confidence": round(confidence, 2),
     }
+
     append_analysis_log(log_entry)
     return log_entry
 
+# ===============================
+#  ENDPOINTS
+# ===============================
+@router.get("/bias/{symbol}")
+def get_market_bias(symbol: str):
+    """Devuelve el último análisis y lo guarda en history."""
+    return compute_market_bias(symbol)
 
-# ===============================
-#  ENDPOINT: HISTORIAL TEMPORAL
-# ===============================
+@router.post("/run")
+@router.get("/run")
+def run_analysis(symbols: str = "QQQ,SPY,NVDA"):
+    """
+    Fuerza análisis para símbolos separados por coma.
+    Ej: /analysis/run?symbols=QQQ,SPY,NVDA
+    """
+    syms = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    if not syms:
+        raise HTTPException(status_code=400, detail="Debes pasar al menos 1 símbolo en symbols=...")
+
+    results = []
+    for s in syms:
+        try:
+            results.append(compute_market_bias(s))
+        except Exception as e:
+            results.append({"symbol": s, "bias": "neutral", "note": f"Error: {e}"})
+
+    return {"status": "ok", "count": len(results), "results": results}
+
 @router.get("/history")
 def get_analysis_history(limit: int = 10):
     return list(reversed(analysis_history[-limit:]))
 
-
-# ===============================
-#  ENDPOINT: SINCRONIZACIÓN PANEL BDV
-# ===============================
 @router.get("/sync")
 def sync_analysis_data():
     if not analysis_history:
@@ -221,30 +264,6 @@ def sync_analysis_data():
         "note": "Datos listos para integración con Panel IA BDV",
     }
 
-
-# ===============================
-#  AUTO-SYNC (1 minuto)
-# ===============================
-def register_auto_sync(app: FastAPI):
-    @app.on_event("startup")
-    @repeat_every(seconds=60)
-    def auto_sync_task() -> None:
-        symbols = ["QQQ", "SPY", "NVDA"]
-        print("[AUTO-SYNC] Iniciando actualización automática...")
-
-        for sym in symbols:
-            try:
-                get_market_bias(sym)
-                print(f"[AUTO-SYNC] ✅ {sym} actualizado")
-            except Exception as e:
-                print(f"[AUTO-SYNC] ⚠️ Error {sym}: {e}")
-
-        print(f"[AUTO-SYNC] Fin. {datetime.utcnow().isoformat()}")
-
-
-# ===============================
-#  HEALTH
-# ===============================
 @router.get("/health")
 def health_check():
     return {
@@ -252,5 +271,23 @@ def health_check():
         "service": "BDV API Server",
         "analysis_count": len(analysis_history),
         "last_update": analysis_history[-1]["timestamp"] if analysis_history else None,
-        "note": "Servicio activo ✅",
+        "feed": APCA_DATA_FEED,
     }
+
+# ===============================
+#  AUTO-SYNC (cada 60s)
+# ===============================
+def register_auto_sync(app: FastAPI):
+    @app.on_event("startup")
+    @repeat_every(seconds=60)
+    def auto_sync_task() -> None:
+        symbols = ["QQQ", "SPY", "NVDA"]
+        print("[AUTO-SYNC] tick…")
+
+        for sym in symbols:
+            try:
+                out = compute_market_bias(sym)
+                # Si viene con note de bars vacío, también lo verás en logs
+                print(f"[AUTO-SYNC] {sym} => {out.get('bias')} {out.get('note','')}".strip())
+            except Exception as e:
+                print(f"[AUTO-SYNC] ⚠️ {sym} error: {e}")
