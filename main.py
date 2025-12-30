@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
 from pydantic import BaseModel
 from typing import Optional, Literal
@@ -7,7 +8,6 @@ import os
 import json
 import requests
 from datetime import datetime
-from fastapi.staticfiles import StaticFiles
 
 # ---------------------------------
 # Cargar variables del entorno
@@ -22,7 +22,9 @@ APCA_TRADING_URL = os.getenv("APCA_TRADING_URL", "https://paper-api.alpaca.marke
 TRADES_LOG_FILE = "trades-log.jsonl"
 
 if not APCA_API_KEY_ID or not APCA_API_SECRET_KEY:
-    raise RuntimeError("Faltan APCA_API_KEY_ID o APCA_API_SECRET_KEY en el entorno (.env o secretos de Render)")
+    raise RuntimeError(
+        "Faltan APCA_API_KEY_ID o APCA_API_SECRET_KEY en el entorno (.env o secretos de Render)"
+    )
 
 def alpaca_headers() -> dict:
     """Headers básicos para cualquier llamada a Alpaca."""
@@ -48,27 +50,28 @@ from routes import pending_trades
 from routes import analysis
 
 # ---------------------------------
-# Inicializar FastAPI  ✅ (CORREGIDO Render + Actions)
+# Inicializar FastAPI ✅ (Render + Actions)
 # ---------------------------------
 app = FastAPI(
     title="BDV API",
     version="0.1.0",
+    # IMPORTANTÍSIMO para Actions: evita que “invente” localhost o el dominio viejo
     servers=[
         {
             "url": "https://bdv-api-server.onrender.com",
-            "description": "Render production"
+            "description": "Render production",
         }
-    ]
+    ],
 )
 
-# ✅ IMPORTANTE: Healthcheck en "/"
-# Esto evita que Actions/Render piense que el server "no existe"
-@app.get("/")
+# ✅ Root healthcheck en "/"
+# Render + validadores + Actions suelen probar "/" primero
+@app.get("/", include_in_schema=False)
 def root():
     return {"status": "ok", "service": "bdv-api", "message": "alive"}
 
-# ✅ Healthcheck extra (muchos validadores lo usan)
-@app.get("/health")
+# ✅ Healthcheck extra (muchos monitores lo usan)
+@app.get("/health", include_in_schema=False)
 def health():
     return {"status": "ok"}
 
@@ -91,7 +94,10 @@ app.include_router(analysis.router)
 # Función auxiliar: última cotización (bid/ask)
 # ---------------------------------
 def get_latest_quote(symbol: str) -> dict:
-    """Consulta la última cotización (bid/ask) en Alpaca para obtener precio más actual."""
+    """
+    Consulta la última cotización (bid/ask) en Alpaca.
+    OJO: el endpoint 'quotes/latest' devuelve 'quote' en Alpaca v2.
+    """
     url = f"{APCA_DATA_URL}/stocks/{symbol}/quotes/latest"
     r = requests.get(url, headers=alpaca_headers(), timeout=10)
     print(f"[DBG] Alpaca latest quote {symbol}: {r.status_code} {r.text[:200]}")
@@ -104,7 +110,7 @@ def get_latest_quote(symbol: str) -> dict:
 @app.get("/snapshot")
 def market_snapshot():
     """
-    Devuelve último precio y hora de QQQ, SPY y NVDA (usando quotes en vivo).
+    Devuelve último precio (ask) y hora de QQQ, SPY y NVDA (usando quotes en vivo).
     """
     try:
         symbols = ["QQQ", "SPY", "NVDA"]
@@ -112,8 +118,15 @@ def market_snapshot():
 
         for sym in symbols:
             raw = get_latest_quote(sym)
-            quote = raw.get("quote", {}) or raw.get("quotes", [{}])[0]
-            data[sym] = {"price": quote.get("ap"), "time": quote.get("t")}
+            quote = raw.get("quote") or {}  # Alpaca v2 -> {'quote': {...}}
+
+            # "ap" = ask price, "bp" = bid price, "t" = timestamp
+            data[sym] = {
+                "price": quote.get("ap"),
+                "time": quote.get("t"),
+                "bid": quote.get("bp"),
+                "ask": quote.get("ap"),
+            }
 
         return {"status": "ok", "data": data}
     except Exception as e:
@@ -126,37 +139,38 @@ def market_snapshot():
 @app.get("/recommend")
 def recommend():
     """
-    Devuelve recomendaciones básicas de mercado.
+    Devuelve recomendaciones básicas de mercado (placeholder).
+    Tu GPT BDV hace el análisis real usando /snapshot.
     """
     data = {
         "status": "ok",
         "recommendations": [
             {
                 "symbol": "QQQ",
-                "price": 622.91,
+                "price": 0,
                 "bias": "neutral",
                 "suggestion": "wait",
-                "target": 622.91,
-                "stop": 622.91,
+                "target": 0,
+                "stop": 0,
             },
             {
                 "symbol": "SPY",
-                "price": 684.28,
+                "price": 0,
                 "bias": "neutral",
                 "suggestion": "wait",
-                "target": 684.28,
-                "stop": 684.28,
+                "target": 0,
+                "stop": 0,
             },
             {
                 "symbol": "NVDA",
-                "price": 183.53,
+                "price": 0,
                 "bias": "neutral",
                 "suggestion": "wait",
-                "target": 183.53,
-                "stop": 183.53,
+                "target": 0,
+                "stop": 0,
             },
         ],
-        "note": "Basado en snapshot. Lógica simple; el GPT BDV aplica análisis y gestión de riesgo.",
+        "note": "Endpoint placeholder. Usa /snapshot para datos reales.",
     }
     return JSONResponse(content=data)
 
@@ -276,11 +290,17 @@ def get_trades_log(limit: int = 10):
         print(f"[ERR] /trades-log: {e}")
         raise HTTPException(status_code=500, detail=f"Error reading trades log: {e}")
 
+# ---------------------------------
+# Auto-sync (si tu analysis router lo usa)
+# ---------------------------------
 from routes.analysis import register_auto_sync
 register_auto_sync(app)
 
-# ✅ CAMBIO CLAVE:
-# NO uses StaticFiles(directory=".")
-# Crea carpeta "ui/" y pon tu index.html o panel.html allí.
-# Ej: ui/index.html
-app.mount("/ui", StaticFiles(directory="ui", html=True), name="ui")
+# ---------------------------------
+# UI (panel)
+# ---------------------------------
+# ✅ NO montes StaticFiles en "/"
+# ✅ Crea carpeta "ui/" en la raíz del repo y pon "index.html" ahí
+# Ej: ui/index.html  -> tu panel
+if os.path.isdir("ui"):
+    app.mount("/ui", StaticFiles(directory="ui", html=True), name="ui")
