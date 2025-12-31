@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+rom fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
@@ -56,6 +56,7 @@ from routes import trade
 from routes import telegram_notify
 from routes import pending_trades
 from routes import analysis
+from routes import candles
 
 # ---------------------------------
 # Inicializar FastAPI ✅ (Render + Actions)
@@ -82,6 +83,7 @@ def root():
         "alpaca_keys_loaded": has_alpaca_keys(),
         "persist_dir": PERSIST_DIR,
     }
+    
 
 # ✅ Healthcheck extra
 @app.get("/health", include_in_schema=False)
@@ -102,6 +104,7 @@ app.include_router(trade.router)
 app.include_router(telegram_notify.router)
 app.include_router(pending_trades.router)
 app.include_router(analysis.router)
+app.include_router(candles.router)
 
 # ---------------------------------
 # Función auxiliar: última cotización (bid/ask)
@@ -299,3 +302,4 @@ register_auto_sync(app)
 # ---------------------------------
 if os.path.isdir("ui"):
     app.mount("/ui", StaticFiles(directory="ui", html=True), name="ui")
+
