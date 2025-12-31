@@ -19,23 +19,61 @@ except Exception:
 router = APIRouter(prefix="/analysis", tags=["analysis"])
 
 # ===============================
-#  LOG DE ANÁLISIS
+#  LOG + HISTÓRICO PERSISTENTE (Render Disk)
 # ===============================
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-LOG_FILE = os.path.join(BASE_DIR, "analysis-log.jsonl")
+# Render Disk típico: /data (ya lo montaste)
+PERSIST_DIR = os.getenv("PERSIST_DIR", "/data")
+os.makedirs(PERSIST_DIR, exist_ok=True)
 
-analysis_history = []  # memoria en runtime (Render no persiste disco)
+LOG_FILE = os.path.join(PERSIST_DIR, "analysis-log.jsonl")
+
+analysis_history = []  # memoria en runtime (se rellena desde disco al startup)
+
+def _safe_json_loads(line: str):
+    try:
+        return json.loads(line)
+    except Exception:
+        return None
+
+def load_history_from_disk(max_lines: int = 5000):
+    """
+    Carga el histórico desde /data/analysis-log.jsonl a memoria (analysis_history)
+    para que NO se pierda al reiniciar Render.
+    """
+    if not os.path.exists(LOG_FILE):
+        print(f"[HISTORY] No existe log aún: {LOG_FILE}")
+        return
+
+    loaded = 0
+    try:
+        with open(LOG_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                obj = _safe_json_loads(line)
+                if obj is not None:
+                    analysis_history.append(obj)
+                    loaded += 1
+
+        # Recortar por seguridad
+        if len(analysis_history) > max_lines:
+            analysis_history[:] = analysis_history[-max_lines:]
+
+        print(f"[HISTORY] Cargados {loaded} registros desde {LOG_FILE}. Mem={len(analysis_history)}")
+    except Exception as e:
+        print(f"[HISTORY] Error cargando historial desde disco: {e}")
 
 def append_analysis_log(entry: dict):
-    """Guarda el resultado en memoria y opcionalmente en archivo local."""
+    """Guarda el resultado en memoria + archivo persistente en /data."""
     try:
         analysis_history.append(entry)
 
-        # Evitar crecimiento infinito
+        # Evitar crecimiento infinito en memoria
         if len(analysis_history) > 5000:
             analysis_history[:] = analysis_history[-2000:]
 
-        # Guardar también en archivo local (best-effort)
+        # Guardar en archivo persistente (best-effort)
         line = json.dumps(entry, ensure_ascii=False)
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(line + "\n")
@@ -141,11 +179,9 @@ def fetch_bars(symbol: str, timeframe: str = "5Min", limit: int = 200):
 
     # A veces puede venir distinto; deja fallback:
     if bars is None:
-        # algunos SDK/devuelven key distinta
         bars = j.get("bar") or j.get("data") or []
 
     # Si por cualquier razón llega como dict, conviértelo a lista:
-    # ej: {"bars":{"QQQ":[...]}} (cuando se pide multi-symbol en otros endpoints)
     if isinstance(bars, dict):
         bars = bars.get(symbol) or bars.get(symbol.upper()) or []
 
@@ -162,13 +198,13 @@ def compute_market_bias(symbol: str) -> dict:
 
     if not bars:
         # Aquí está tu caso actual
-        return {"symbol": symbol, "bias": "neutral", "note": "No se recibieron datos (bars vacío). Revisa feed/mercado."}
+        return {"symbol": symbol.upper(), "bias": "neutral", "note": "No se recibieron datos (bars vacío). Revisa feed/mercado."}
 
     closes = np.array([b.get("c") for b in bars if b.get("c") is not None], dtype=float)
     volumes = np.array([b.get("v") for b in bars if b.get("v") is not None], dtype=float)
 
     if len(closes) < 30 or len(volumes) < 30:
-        return {"symbol": symbol, "bias": "neutral", "note": "Datos insuficientes (menos de 30 barras)."}
+        return {"symbol": symbol.upper(), "bias": "neutral", "note": "Datos insuficientes (menos de 30 barras)."}
 
     ema9 = ema(closes, 9)
     ema20 = ema(closes, 20)
@@ -206,7 +242,7 @@ def compute_market_bias(symbol: str) -> dict:
         "rsi": round(rsi, 2),
         "volume_ratio": round(vol_ratio, 2),
         "bias": bias,
-        "confidence": round(confidence, 2),
+        "confidence": round(float(confidence), 2),
     }
 
     append_analysis_log(log_entry)
@@ -242,6 +278,7 @@ def run_analysis(symbols: str = "QQQ,SPY,NVDA"):
 
 @router.get("/history")
 def get_analysis_history(limit: int = 10):
+    # devuelve los últimos N (en orden reciente->antiguo)
     return list(reversed(analysis_history[-limit:]))
 
 @router.get("/sync")
@@ -272,12 +309,27 @@ def health_check():
         "analysis_count": len(analysis_history),
         "last_update": analysis_history[-1]["timestamp"] if analysis_history else None,
         "feed": APCA_DATA_FEED,
+        "log_file": LOG_FILE,
+        "persist_dir": PERSIST_DIR,
     }
 
 # ===============================
 #  AUTO-SYNC (cada 60s)
 # ===============================
 def register_auto_sync(app: FastAPI):
+    """
+    IMPORTANTE:
+    - Esta función debe ser llamada desde main.py (o donde creas FastAPI)
+      Ej:
+        from routes.analysis import register_auto_sync
+        register_auto_sync(app)
+    """
+
+    @app.on_event("startup")
+    def _load_history_once():
+        # Cargar histórico persistente a memoria al iniciar
+        load_history_from_disk()
+
     @app.on_event("startup")
     @repeat_every(seconds=60)
     def auto_sync_task() -> None:
@@ -287,7 +339,6 @@ def register_auto_sync(app: FastAPI):
         for sym in symbols:
             try:
                 out = compute_market_bias(sym)
-                # Si viene con note de bars vacío, también lo verás en logs
                 print(f"[AUTO-SYNC] {sym} => {out.get('bias')} {out.get('note','')}".strip())
             except Exception as e:
                 print(f"[AUTO-SYNC] ⚠️ {sym} error: {e}")
