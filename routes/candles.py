@@ -1,80 +1,157 @@
 from fastapi import APIRouter, HTTPException, Query
-import os
-import requests
-from typing import Any, Dict, List, Optional
+from dotenv import load_dotenv
+import os, json, time, requests
+from datetime import datetime, timedelta, timezone
+from typing import Optional
 
-router = APIRouter(prefix="/candles", tags=["candles"])
+load_dotenv()
 
-APCA_DATA_URL = os.getenv("APCA_DATA_URL", "https://data.alpaca.markets/v2").rstrip("/")
+router = APIRouter(tags=["candles"])
+
 APCA_API_KEY_ID = os.getenv("APCA_API_KEY_ID")
 APCA_API_SECRET_KEY = os.getenv("APCA_API_SECRET_KEY")
+APCA_DATA_URL = os.getenv("APCA_DATA_URL", "https://data.alpaca.markets/v2")
 
-def _alpaca_headers() -> Dict[str, str]:
-    if not APCA_API_KEY_ID or not APCA_API_SECRET_KEY:
-        raise HTTPException(
-            status_code=500,
-            detail="Faltan APCA_API_KEY_ID / APCA_API_SECRET_KEY en el entorno."
-        )
+PERSIST_DIR = os.getenv("PERSIST_DIR", "/data")
+os.makedirs(PERSIST_DIR, exist_ok=True)
+
+def has_keys():
+    return bool(APCA_API_KEY_ID and APCA_API_SECRET_KEY)
+
+def headers():
+    if not has_keys():
+        raise HTTPException(status_code=500, detail="Missing Alpaca keys in environment.")
     return {
         "APCA-API-KEY-ID": APCA_API_KEY_ID,
         "APCA-API-SECRET-KEY": APCA_API_SECRET_KEY,
-        "accept": "application/json",
+        "Accept": "application/json",
     }
 
-@router.get("")
-def get_candles(
-    symbol: str = Query(..., min_length=1),
-    timeframe: str = Query("5Min"),
-    limit: int = Query(200, ge=1, le=10000),
-    adjustment: str = Query("raw"),
-    feed: Optional[str] = Query(None),  # "iex" o "sip" (si tu plan lo permite)
-) -> Dict[str, Any]:
-    """
-    Devuelve velas (bars) desde Alpaca Market Data v2.
-    Endpoint Alpaca: /v2/stocks/{symbol}/bars
-    """
-    symbol = symbol.upper().strip()
+def _iso(dt: datetime) -> str:
+    # Alpaca espera ISO8601 con Z
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
+def _cache_path(symbol: str, timeframe: str) -> str:
+    safe = f"{symbol}_{timeframe}".replace("/", "_")
+    return os.path.join(PERSIST_DIR, f"candles_cache_{safe}.json")
+
+def _read_cache(path: str, ttl: int):
+    try:
+        if not os.path.exists(path):
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        ts = data.get("_ts", 0)
+        if time.time() - ts <= ttl:
+            return data
+        return None
+    except Exception:
+        return None
+
+def _write_cache(path: str, payload: dict):
+    try:
+        payload["_ts"] = time.time()
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+def fetch_bars_from_alpaca(
+    symbol: str,
+    timeframe: str,
+    limit: int,
+    start: Optional[str],
+    end: Optional[str],
+    feed: str,
+    adjustment: str,
+) -> dict:
+    # Endpoint correcto Alpaca Data v2:
+    # GET /v2/stocks/{symbol}/bars
     url = f"{APCA_DATA_URL}/stocks/{symbol}/bars"
     params = {
         "timeframe": timeframe,
         "limit": limit,
-        "adjustment": adjustment,
+        "feed": feed,              # para cuentas free suele funcionar "iex"
+        "adjustment": adjustment,  # "raw" o "all"
     }
-    if feed:
-        params["feed"] = feed
+    if start:
+        params["start"] = start
+    if end:
+        params["end"] = end
+
+    r = requests.get(url, headers=headers(), params=params, timeout=15)
+
+    # Debug corto en logs (Render)
+    print(f"[candles] GET {r.url} -> {r.status_code}")
+    if r.status_code >= 400:
+        print(f"[candles] ERR body: {r.text[:500]}")
+
+    r.raise_for_status()
+    return r.json()
+
+@router.get("/candles")
+def get_candles(
+    symbol: str = Query(..., description="Ej: SPY, QQQ, NVDA"),
+    timeframe: str = Query("5Min", description="1Min, 5Min, 15Min, 1Hour, 1Day"),
+    limit: int = Query(200, ge=1, le=10000),
+    # Si NO mandas start/end, Alpaca normalmente devuelve las últimas `limit` velas.
+    # Pero para evitar 0 fuera de sesión, ponemos un default inteligente (últimos ~10 días calendario):
+    start: Optional[str] = Query(None, description="ISO8601, ej: 2025-12-20T00:00:00Z"),
+    end: Optional[str] = Query(None, description="ISO8601, ej: 2025-12-31T23:59:59Z"),
+    feed: str = Query("iex", description="iex (free), sip (si tienes suscripción)"),
+    adjustment: str = Query("raw", description="raw/all"),
+    use_cache: bool = Query(True),
+    cache_ttl_sec: int = Query(30, ge=0, le=600),
+):
+    if not has_keys():
+        raise HTTPException(status_code=500, detail="Alpaca keys not configured.")
+
+    cache_file = _cache_path(symbol, timeframe)
+    if use_cache and cache_ttl_sec > 0:
+        cached = _read_cache(cache_file, cache_ttl_sec)
+        if cached:
+            return cached
+
+    # Default inteligente de rango si NO mandan start/end:
+    # Así siempre trae velas aunque sea madrugada.
+    if not start and not end:
+        now = datetime.now(timezone.utc)
+        # 10 días calendario para cubrir ~5 días de trading
+        start_dt = now - timedelta(days=10)
+        start = _iso(start_dt)
+        end = _iso(now)
 
     try:
-        r = requests.get(url, headers=_alpaca_headers(), params=params, timeout=20)
+        raw = fetch_bars_from_alpaca(
+            symbol=symbol,
+            timeframe=timeframe,
+            limit=limit,
+            start=start,
+            end=end,
+            feed=feed,
+            adjustment=adjustment,
+        )
 
-        # Si Alpaca devuelve error, lo mostramos claro (y NO 500 genérico)
-        if r.status_code != 200:
-            try:
-                err = r.json()
-            except Exception:
-                err = {"raw": r.text}
-            raise HTTPException(
-                status_code=r.status_code,
-                detail={"alpaca_error": err, "url": url, "params": params},
-            )
-
-        payload = r.json()
-        bars = payload.get("bars") or payload.get("data") or []
-
-        return {
+        bars = raw.get("bars") or []
+        payload = {
             "status": "ok",
             "symbol": symbol,
             "timeframe": timeframe,
             "limit": limit,
             "count": len(bars),
             "bars": bars,
-            "next_page_token": payload.get("next_page_token"),
+            "next_page_token": raw.get("next_page_token"),
+            "range": {"start": start, "end": end},
+            "feed": feed,
+            "adjustment": adjustment,
         }
 
-    except HTTPException:
-        raise
+        if use_cache and cache_ttl_sec > 0:
+            _write_cache(cache_file, payload)
+
+        return payload
+
+    except requests.HTTPError as e:
+        raise HTTPException(status_code=500, detail=f"Alpaca bars error: {str(e)}")
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail={"message": str(e), "url": url, "params": params},
-        )
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
