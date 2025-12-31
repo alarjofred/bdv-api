@@ -1,80 +1,80 @@
-from fastapi import APIRouter, HTTPException
-import os, requests, json, time
-from datetime import datetime, timezone
+from fastapi import APIRouter, HTTPException, Query
+import os
+import requests
+from typing import Any, Dict, List, Optional
 
 router = APIRouter(prefix="/candles", tags=["candles"])
 
+APCA_DATA_URL = os.getenv("APCA_DATA_URL", "https://data.alpaca.markets/v2").rstrip("/")
 APCA_API_KEY_ID = os.getenv("APCA_API_KEY_ID")
 APCA_API_SECRET_KEY = os.getenv("APCA_API_SECRET_KEY")
-APCA_DATA_URL = os.getenv("APCA_DATA_URL", "https://data.alpaca.markets/v2")
 
-PERSIST_DIR = os.getenv("PERSIST_DIR", "/data")
-os.makedirs(PERSIST_DIR, exist_ok=True)
-
-def alpaca_headers():
+def _alpaca_headers() -> Dict[str, str]:
     if not APCA_API_KEY_ID or not APCA_API_SECRET_KEY:
-        return None
+        raise HTTPException(
+            status_code=500,
+            detail="Faltan APCA_API_KEY_ID / APCA_API_SECRET_KEY en el entorno."
+        )
     return {
         "APCA-API-KEY-ID": APCA_API_KEY_ID,
         "APCA-API-SECRET-KEY": APCA_API_SECRET_KEY,
+        "accept": "application/json",
     }
 
-def cache_path(symbol: str, timeframe: str):
-    safe_tf = timeframe.replace("/", "_")
-    return os.path.join(PERSIST_DIR, f"{symbol}_{safe_tf}.json")
-
 @router.get("")
-def get_candles(symbol: str, tf: str = "5Min", limit: int = 78, use_cache: bool = True, cache_ttl_sec: int = 30):
+def get_candles(
+    symbol: str = Query(..., min_length=1),
+    timeframe: str = Query("5Min"),
+    limit: int = Query(200, ge=1, le=10000),
+    adjustment: str = Query("raw"),
+    feed: Optional[str] = Query(None),  # "iex" o "sip" (si tu plan lo permite)
+) -> Dict[str, Any]:
     """
-    tf: 5Min | 15Min | 1Hour
-    limit recomendado:
-      5Min=78 (1 dia aprox)
-      15Min=130 (5 dias aprox)
-      1Hour=120 (1 mes aprox)
+    Devuelve velas (bars) desde Alpaca Market Data v2.
+    Endpoint Alpaca: /v2/stocks/{symbol}/bars
     """
-    headers = alpaca_headers()
-    if headers is None:
-        raise HTTPException(status_code=500, detail="Faltan APCA_API_KEY_ID / APCA_API_SECRET_KEY")
-
-    # Cache simple en /data para evitar pegarle a Alpaca cada request
-    cpath = cache_path(symbol, tf)
-    now = time.time()
-
-    if use_cache and os.path.exists(cpath):
-        try:
-            with open(cpath, "r", encoding="utf-8") as f:
-                cached = json.load(f)
-            if now - cached.get("_ts", 0) <= cache_ttl_sec:
-                return {"status":"ok","source":"cache","symbol":symbol,"tf":tf,"limit":limit,"bars":cached["bars"]}
-        except:
-            pass
+    symbol = symbol.upper().strip()
 
     url = f"{APCA_DATA_URL}/stocks/{symbol}/bars"
-    params = {"timeframe": tf, "limit": limit, "adjustment": "raw"}
-    r = requests.get(url, headers=headers, params=params, timeout=15)
+    params = {
+        "timeframe": timeframe,
+        "limit": limit,
+        "adjustment": adjustment,
+    }
+    if feed:
+        params["feed"] = feed
 
-    if r.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"Alpaca bars error: {r.status_code} {r.text}")
-
-    payload = r.json()
-    bars = payload.get("bars", [])  # Alpaca v2 suele devolver "bars"
-    # Normalizamos por si cambia
-    out = []
-    for b in bars:
-        out.append({
-            "t": b.get("t"),  # timestamp ISO
-            "o": b.get("o"),
-            "h": b.get("h"),
-            "l": b.get("l"),
-            "c": b.get("c"),
-            "v": b.get("v"),
-        })
-
-    # guardamos cache
     try:
-        with open(cpath, "w", encoding="utf-8") as f:
-            json.dump({"_ts": now, "bars": out}, f, ensure_ascii=False)
-    except:
-        pass
+        r = requests.get(url, headers=_alpaca_headers(), params=params, timeout=20)
 
-    return {"status":"ok","source":"alpaca","symbol":symbol,"tf":tf,"limit":limit,"bars":out}
+        # Si Alpaca devuelve error, lo mostramos claro (y NO 500 genérico)
+        if r.status_code != 200:
+            try:
+                err = r.json()
+            except Exception:
+                err = {"raw": r.text}
+            raise HTTPException(
+                status_code=r.status_code,
+                detail={"alpaca_error": err, "url": url, "params": params},
+            )
+
+        payload = r.json()
+        bars = payload.get("bars") or payload.get("data") or []
+
+        return {
+            "status": "ok",
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "limit": limit,
+            "count": len(bars),
+            "bars": bars,
+            "next_page_token": payload.get("next_page_token"),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail={"message": str(e), "url": url, "params": params},
+        )
