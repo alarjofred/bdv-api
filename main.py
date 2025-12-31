@@ -1,4 +1,4 @@
-rom fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
@@ -20,14 +20,15 @@ APCA_DATA_URL = os.getenv("APCA_DATA_URL", "https://data.alpaca.markets/v2")
 APCA_TRADING_URL = os.getenv("APCA_TRADING_URL", "https://paper-api.alpaca.markets/v2")
 
 # ✅ DISCO PERSISTENTE (Render Disk)
-# En Render montaste el disk en /data (según tu screenshot).
 PERSIST_DIR = os.getenv("PERSIST_DIR", "/data")
 os.makedirs(PERSIST_DIR, exist_ok=True)
 
 TRADES_LOG_FILE = os.path.join(PERSIST_DIR, "trades-log.jsonl")
 
+
 def has_alpaca_keys() -> bool:
     return bool(APCA_API_KEY_ID and APCA_API_SECRET_KEY)
+
 
 def alpaca_headers() -> dict:
     """Headers básicos para cualquier llamada a Alpaca."""
@@ -42,8 +43,9 @@ def alpaca_headers() -> dict:
         "Accept": "application/json",
     }
 
+
 # ---------------------------------
-# IMPORT DE ROUTERS
+# IMPORT DE ROUTERS (con protección)
 # ---------------------------------
 from routes.test_alpaca import router as test_alpaca_router
 from routes.recommend import router as recommend_router
@@ -55,8 +57,20 @@ from routes.alpaca_close import router as alpaca_close_router
 from routes import trade
 from routes import telegram_notify
 from routes import pending_trades
-from routes import analysis
-from routes import candles
+
+# Estos pueden fallar si el archivo no existe / tiene error.
+try:
+    from routes import analysis
+except Exception as e:
+    analysis = None
+    print(f"[WARN] No se pudo importar routes.analysis: {e}")
+
+try:
+    from routes import candles
+except Exception as e:
+    candles = None
+    print(f"[WARN] No se pudo importar routes.candles: {e}")
+
 
 # ---------------------------------
 # Inicializar FastAPI ✅ (Render + Actions)
@@ -64,7 +78,6 @@ from routes import candles
 app = FastAPI(
     title="BDV API",
     version="0.1.0",
-    # IMPORTANTÍSIMO para Actions: evita que “invente” localhost o el dominio viejo
     servers=[
         {
             "url": "https://bdv-api-server.onrender.com",
@@ -83,12 +96,12 @@ def root():
         "alpaca_keys_loaded": has_alpaca_keys(),
         "persist_dir": PERSIST_DIR,
     }
-    
 
-# ✅ Healthcheck extra
+
 @app.get("/health", include_in_schema=False)
 def health():
     return {"status": "ok", "alpaca_keys_loaded": has_alpaca_keys()}
+
 
 # ---------------------------------
 # Incluir routers
@@ -103,8 +116,13 @@ app.include_router(alpaca_close_router)
 app.include_router(trade.router)
 app.include_router(telegram_notify.router)
 app.include_router(pending_trades.router)
-app.include_router(analysis.router)
-app.include_router(candles.router)
+
+if analysis is not None:
+    app.include_router(analysis.router)
+
+if candles is not None:
+    app.include_router(candles.router)
+
 
 # ---------------------------------
 # Función auxiliar: última cotización (bid/ask)
@@ -120,6 +138,7 @@ def get_latest_quote(symbol: str) -> dict:
     r.raise_for_status()
     return r.json()
 
+
 # ---------------------------------
 # Endpoint /snapshot
 # ---------------------------------
@@ -127,7 +146,6 @@ def get_latest_quote(symbol: str) -> dict:
 def market_snapshot():
     """
     Devuelve último precio (ask) y hora de QQQ, SPY y NVDA (usando quotes).
-    Nota: si el mercado está cerrado, los quotes pueden ser estáticos.
     """
     try:
         if not has_alpaca_keys():
@@ -155,6 +173,7 @@ def market_snapshot():
         print(f"[ERR] /snapshot: {e}")
         raise HTTPException(status_code=500, detail=f"Error getting snapshot: {e}")
 
+
 # ---------------------------------
 # Endpoint /recommend (placeholder)
 # ---------------------------------
@@ -171,6 +190,7 @@ def recommend():
     }
     return JSONResponse(content=data)
 
+
 # ---------------------------------
 # Modelo para /trade
 # ---------------------------------
@@ -181,6 +201,7 @@ class TradeRequest(BaseModel):
     type: Literal["market", "limit"] = "market"
     time_in_force: Literal["day", "gtc"] = "day"
     limit_price: Optional[float] = None
+
 
 # ---------------------------------
 # Log de trades en archivo persistente
@@ -193,6 +214,7 @@ def append_trade_log(entry: dict) -> None:
             f.write(line + "\n")
     except Exception as e:
         print(f"[WARN] No se pudo escribir en el log de trades: {e}")
+
 
 # ---------------------------------
 # Endpoint /trade (ejecutar orden en Alpaca)
@@ -261,6 +283,7 @@ def place_trade(req: TradeRequest):
         print(f"[ERR] /trade: {e}")
         raise HTTPException(status_code=500, detail=f"Unexpected error placing trade: {e}")
 
+
 # ---------------------------------
 # Endpoint /trades-log (leer log persistente)
 # ---------------------------------
@@ -291,15 +314,20 @@ def get_trades_log(limit: int = 10):
         print(f"[ERR] /trades-log: {e}")
         raise HTTPException(status_code=500, detail=f"Error reading trades log: {e}")
 
+
 # ---------------------------------
 # Auto-sync (si tu analysis router lo usa)
 # ---------------------------------
-from routes.analysis import register_auto_sync
-register_auto_sync(app)
+try:
+    if analysis is not None:
+        from routes.analysis import register_auto_sync
+        register_auto_sync(app)
+except Exception as e:
+    print(f"[WARN] register_auto_sync no pudo registrarse: {e}")
+
 
 # ---------------------------------
 # UI (panel)
 # ---------------------------------
 if os.path.isdir("ui"):
     app.mount("/ui", StaticFiles(directory="ui", html=True), name="ui")
-
