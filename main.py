@@ -19,15 +19,23 @@ APCA_API_SECRET_KEY = os.getenv("APCA_API_SECRET_KEY")
 APCA_DATA_URL = os.getenv("APCA_DATA_URL", "https://data.alpaca.markets/v2")
 APCA_TRADING_URL = os.getenv("APCA_TRADING_URL", "https://paper-api.alpaca.markets/v2")
 
-TRADES_LOG_FILE = "trades-log.jsonl"
+# ✅ DISCO PERSISTENTE (Render Disk)
+# En Render montaste el disk en /data (según tu screenshot).
+PERSIST_DIR = os.getenv("PERSIST_DIR", "/data")
+os.makedirs(PERSIST_DIR, exist_ok=True)
 
-if not APCA_API_KEY_ID or not APCA_API_SECRET_KEY:
-    raise RuntimeError(
-        "Faltan APCA_API_KEY_ID o APCA_API_SECRET_KEY en el entorno (.env o secretos de Render)"
-    )
+TRADES_LOG_FILE = os.path.join(PERSIST_DIR, "trades-log.jsonl")
+
+def has_alpaca_keys() -> bool:
+    return bool(APCA_API_KEY_ID and APCA_API_SECRET_KEY)
 
 def alpaca_headers() -> dict:
     """Headers básicos para cualquier llamada a Alpaca."""
+    if not has_alpaca_keys():
+        raise HTTPException(
+            status_code=500,
+            detail="Faltan APCA_API_KEY_ID / APCA_API_SECRET_KEY en el entorno (Render Environment).",
+        )
     return {
         "APCA-API-KEY-ID": APCA_API_KEY_ID,
         "APCA-API-SECRET-KEY": APCA_API_SECRET_KEY,
@@ -65,15 +73,20 @@ app = FastAPI(
 )
 
 # ✅ Root healthcheck en "/"
-# Render + validadores + Actions suelen probar "/" primero
 @app.get("/", include_in_schema=False)
 def root():
-    return {"status": "ok", "service": "bdv-api", "message": "alive"}
+    return {
+        "status": "ok",
+        "service": "bdv-api",
+        "message": "alive",
+        "alpaca_keys_loaded": has_alpaca_keys(),
+        "persist_dir": PERSIST_DIR,
+    }
 
-# ✅ Healthcheck extra (muchos monitores lo usan)
+# ✅ Healthcheck extra
 @app.get("/health", include_in_schema=False)
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "alpaca_keys_loaded": has_alpaca_keys()}
 
 # ---------------------------------
 # Incluir routers
@@ -96,7 +109,7 @@ app.include_router(analysis.router)
 def get_latest_quote(symbol: str) -> dict:
     """
     Consulta la última cotización (bid/ask) en Alpaca.
-    OJO: el endpoint 'quotes/latest' devuelve 'quote' en Alpaca v2.
+    Endpoint: /stocks/{symbol}/quotes/latest -> devuelve {"quote": {...}}
     """
     url = f"{APCA_DATA_URL}/stocks/{symbol}/quotes/latest"
     r = requests.get(url, headers=alpaca_headers(), timeout=10)
@@ -110,17 +123,20 @@ def get_latest_quote(symbol: str) -> dict:
 @app.get("/snapshot")
 def market_snapshot():
     """
-    Devuelve último precio (ask) y hora de QQQ, SPY y NVDA (usando quotes en vivo).
+    Devuelve último precio (ask) y hora de QQQ, SPY y NVDA (usando quotes).
+    Nota: si el mercado está cerrado, los quotes pueden ser estáticos.
     """
     try:
+        if not has_alpaca_keys():
+            raise HTTPException(status_code=500, detail="Faltan keys de Alpaca para /snapshot.")
+
         symbols = ["QQQ", "SPY", "NVDA"]
         data = {}
 
         for sym in symbols:
             raw = get_latest_quote(sym)
-            quote = raw.get("quote") or {}  # Alpaca v2 -> {'quote': {...}}
+            quote = raw.get("quote") or {}
 
-            # "ap" = ask price, "bp" = bid price, "t" = timestamp
             data[sym] = {
                 "price": quote.get("ap"),
                 "time": quote.get("t"),
@@ -129,48 +145,26 @@ def market_snapshot():
             }
 
         return {"status": "ok", "data": data}
+
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"[ERR] /snapshot: {e}")
         raise HTTPException(status_code=500, detail=f"Error getting snapshot: {e}")
 
 # ---------------------------------
-# Endpoint /recommend
+# Endpoint /recommend (placeholder)
 # ---------------------------------
 @app.get("/recommend")
 def recommend():
-    """
-    Devuelve recomendaciones básicas de mercado (placeholder).
-    Tu GPT BDV hace el análisis real usando /snapshot.
-    """
     data = {
         "status": "ok",
         "recommendations": [
-            {
-                "symbol": "QQQ",
-                "price": 0,
-                "bias": "neutral",
-                "suggestion": "wait",
-                "target": 0,
-                "stop": 0,
-            },
-            {
-                "symbol": "SPY",
-                "price": 0,
-                "bias": "neutral",
-                "suggestion": "wait",
-                "target": 0,
-                "stop": 0,
-            },
-            {
-                "symbol": "NVDA",
-                "price": 0,
-                "bias": "neutral",
-                "suggestion": "wait",
-                "target": 0,
-                "stop": 0,
-            },
+            {"symbol": "QQQ", "price": 0, "bias": "neutral", "suggestion": "wait", "target": 0, "stop": 0},
+            {"symbol": "SPY", "price": 0, "bias": "neutral", "suggestion": "wait", "target": 0, "stop": 0},
+            {"symbol": "NVDA", "price": 0, "bias": "neutral", "suggestion": "wait", "target": 0, "stop": 0},
         ],
-        "note": "Endpoint placeholder. Usa /snapshot para datos reales.",
+        "note": "Endpoint placeholder. Usa /snapshot + /analysis/* para datos reales.",
     }
     return JSONResponse(content=data)
 
@@ -186,10 +180,10 @@ class TradeRequest(BaseModel):
     limit_price: Optional[float] = None
 
 # ---------------------------------
-# Log de trades en archivo local
+# Log de trades en archivo persistente
 # ---------------------------------
 def append_trade_log(entry: dict) -> None:
-    """Guarda una línea JSON por trade en un archivo local."""
+    """Guarda una línea JSON por trade en archivo persistente (/data)."""
     try:
         line = json.dumps(entry, ensure_ascii=False)
         with open(TRADES_LOG_FILE, "a", encoding="utf-8") as f:
@@ -198,13 +192,16 @@ def append_trade_log(entry: dict) -> None:
         print(f"[WARN] No se pudo escribir en el log de trades: {e}")
 
 # ---------------------------------
-# Endpoint /trade  (ejecutar orden en Alpaca)
+# Endpoint /trade (ejecutar orden en Alpaca)
 # ---------------------------------
 @app.post("/trade")
 def place_trade(req: TradeRequest):
     """
-    Envía una orden a Alpaca y la registra en el log.
+    Envía una orden a Alpaca y la registra en el log persistente.
     """
+    if not has_alpaca_keys():
+        raise HTTPException(status_code=500, detail="Faltan keys de Alpaca para /trade.")
+
     orders_url = f"{APCA_TRADING_URL}/orders"
     payload = {
         "symbol": req.symbol,
@@ -262,16 +259,16 @@ def place_trade(req: TradeRequest):
         raise HTTPException(status_code=500, detail=f"Unexpected error placing trade: {e}")
 
 # ---------------------------------
-# Endpoint /trades-log  (leer log)
+# Endpoint /trades-log (leer log persistente)
 # ---------------------------------
 @app.get("/trades-log")
 def get_trades_log(limit: int = 10):
     """
-    Devuelve las últimas operaciones registradas en el log local.
+    Devuelve las últimas operaciones registradas en el log persistente.
     """
     try:
         if not os.path.exists(TRADES_LOG_FILE):
-            return {"status": "ok", "log": []}
+            return {"status": "ok", "log": [], "file": TRADES_LOG_FILE}
 
         entries = []
         with open(TRADES_LOG_FILE, "r", encoding="utf-8") as f:
@@ -285,7 +282,8 @@ def get_trades_log(limit: int = 10):
                     continue
 
         entries = entries[-limit:]
-        return {"status": "ok", "log": entries}
+        return {"status": "ok", "log": entries, "file": TRADES_LOG_FILE}
+
     except Exception as e:
         print(f"[ERR] /trades-log: {e}")
         raise HTTPException(status_code=500, detail=f"Error reading trades log: {e}")
@@ -299,8 +297,5 @@ register_auto_sync(app)
 # ---------------------------------
 # UI (panel)
 # ---------------------------------
-# ✅ NO montes StaticFiles en "/"
-# ✅ Crea carpeta "ui/" en la raíz del repo y pon "index.html" ahí
-# Ej: ui/index.html  -> tu panel
 if os.path.isdir("ui"):
     app.mount("/ui", StaticFiles(directory="ui", html=True), name="ui")
