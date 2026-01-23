@@ -35,9 +35,9 @@ def _update_max_trades() -> None:
     Ajusta el máximo de trades por día según el modo de riesgo.
     """
     if config_state.risk_mode == RiskMode.low:
-        config_state.max_trades_per_day = 2
+        config_state.max_trades_per_day = 1
     elif config_state.risk_mode == RiskMode.medium:
-        config_state.max_trades_per_day = 4
+        config_state.max_trades_per_day = 3
     elif config_state.risk_mode == RiskMode.high:
         config_state.max_trades_per_day = 5
 
