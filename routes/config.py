@@ -16,11 +16,20 @@ class RiskMode(str, Enum):
     high = "high"
 
 
+# ✅ Opción A: risk_mode es la única fuente de verdad del límite diario
+MAX_TRADES_BY_RISK = {
+    RiskMode.low: 1,
+    RiskMode.medium: 3,
+    RiskMode.high: 5,
+}
+
+
 class ConfigStatus(BaseModel):
     execution_mode: ExecutionMode = ExecutionMode.manual
     risk_mode: RiskMode = RiskMode.low
 
-    # ✅ FIX: no puede arrancar en 0 si el risk_mode default es low
+    # ✅ FIX: no puede arrancar en 0 si risk_mode default es low
+    # Se mantiene, pero se sincroniza SIEMPRE con risk_mode.
     max_trades_per_day: int = 1
 
     trades_today: int = 0
@@ -30,16 +39,12 @@ class ConfigStatus(BaseModel):
 config_state = ConfigStatus()
 
 
-def _update_max_trades() -> None:
+def _sync_max_trades() -> None:
     """
-    Ajusta el máximo de trades por día según el modo de riesgo.
+    Recalcula SIEMPRE el máximo de trades por día según el risk_mode.
+    Evita desincronización (ej: que LOW termine mostrando 2).
     """
-    if config_state.risk_mode == RiskMode.low:
-        config_state.max_trades_per_day = 1
-    elif config_state.risk_mode == RiskMode.medium:
-        config_state.max_trades_per_day = 3
-    elif config_state.risk_mode == RiskMode.high:
-        config_state.max_trades_per_day = 5
+    config_state.max_trades_per_day = int(MAX_TRADES_BY_RISK.get(config_state.risk_mode, 1))
 
 
 class ExecutionModeUpdate(BaseModel):
@@ -52,27 +57,32 @@ class RiskModeUpdate(BaseModel):
 
 @router.get("/status", response_model=ConfigStatus)
 def get_config_status() -> ConfigStatus:
+    # ✅ importante: antes de responder, sincroniza
+    _sync_max_trades()
     return config_state
 
 
 @router.post("/execution-mode", response_model=ConfigStatus)
 def set_execution_mode(payload: ExecutionModeUpdate) -> ConfigStatus:
     config_state.execution_mode = payload.mode
+    # ✅ no cambia límites, pero mantiene consistencia
+    _sync_max_trades()
     return config_state
 
 
 @router.post("/risk-mode", response_model=ConfigStatus)
 def set_risk_mode(payload: RiskModeUpdate) -> ConfigStatus:
     config_state.risk_mode = payload.mode
-    _update_max_trades()
+    _sync_max_trades()
     return config_state
 
 
 @router.post("/reset-trades", response_model=ConfigStatus)
 def reset_trades_today() -> ConfigStatus:
     config_state.trades_today = 0
+    _sync_max_trades()
     return config_state
 
 
-# ✅ FIX adicional: recalcula SIEMPRE al arrancar el server
-_update_max_trades()
+# ✅ FIX adicional: sincroniza SIEMPRE al arrancar el server
+_sync_max_trades()
