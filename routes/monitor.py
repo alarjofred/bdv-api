@@ -3,15 +3,19 @@
 from fastapi import APIRouter, HTTPException, Header
 import os
 import requests
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from zoneinfo import ZoneInfo
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
+
 from .pending_trades import PENDING_TRADES
 
 router = APIRouter(prefix="/monitor", tags=["monitor"])
 
 API_BASE = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
-TRADING_URL = os.getenv("APCA_TRADING_URL", "https://paper-api.alpaca.markets").rstrip("/")
+
+# ✅ Normaliza APCA_TRADING_URL para que NO termine en /v2 (porque abajo ya agregamos /v2/...)
+_raw_trading = os.getenv("APCA_TRADING_URL", "https://paper-api.alpaca.markets").rstrip("/")
+TRADING_URL = _raw_trading[:-3] if _raw_trading.endswith("/v2") else _raw_trading
 
 # Seguridad: el cron/agente debe enviar este header
 BDV_AGENT_SECRET = os.getenv("BDV_AGENT_SECRET", "").strip()
@@ -53,7 +57,7 @@ def get_config_status() -> Dict[str, Any]:
         return {}
 
 
-def get_account_and_positions() -> (Dict[str, Any], List[Dict[str, Any]]):
+def get_account_and_positions() -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     headers = get_alpaca_headers()
 
     acc_resp = requests.get(f"{TRADING_URL}/v2/account", headers=headers, timeout=5)
@@ -152,7 +156,15 @@ def _process_pending_trades(snapshot_data: Dict[str, Dict[str, Any]], allow_exec
         if trade.valid_until and now > trade.valid_until:
             trade.status = "expired"
             trade.expired_at = now
-            ejecuciones.append({"id": trade.id, "symbol": trade.symbol, "side": trade.side, "status": "expired", "reason": "valid_until alcanzado"})
+            ejecuciones.append(
+                {
+                    "id": trade.id,
+                    "symbol": trade.symbol,
+                    "side": trade.side,
+                    "status": "expired",
+                    "reason": "valid_until alcanzado",
+                }
+            )
             continue
 
         info = snapshot_data.get(trade.symbol) or {}
