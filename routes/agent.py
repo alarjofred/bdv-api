@@ -26,10 +26,7 @@ OPENAI_ENABLED = os.getenv("OPENAI_ENABLED", "0").strip() in ("1", "true", "True
 AGENT_SYMBOLS = os.getenv("AGENT_SYMBOLS", "QQQ,SPY,NVDA")
 AGENT_SEND_TELEGRAM = os.getenv("AGENT_SEND_TELEGRAM", "1").strip() not in ("0", "false", "False", "no", "NO")
 
-# “Semáforo” y tolerancias (para que no vivas en NO TRADE eterno)
-# - GREEN: operable y fresco (<=120s) y en RTH
-# - YELLOW: data OK pero snapshot un poco viejo o fuera de RTH (manda resumen, NO trade)
-# - RED: API/config/snapshot roto
+# Semáforo y tolerancias
 AGENT_STALE_GREEN_MAX_SEC = int(os.getenv("AGENT_STALE_GREEN_MAX_SEC", "120"))
 AGENT_STALE_YELLOW_MAX_SEC = int(os.getenv("AGENT_STALE_YELLOW_MAX_SEC", "600"))  # 10 min
 AGENT_ALLOW_YELLOW_SUMMARY = os.getenv("AGENT_ALLOW_YELLOW_SUMMARY", "1").strip() in ("1", "true", "True", "yes", "YES")
@@ -117,7 +114,10 @@ def _call_openai_bdv(prompt: str) -> str:
     for item in out if isinstance(out, list) else []:
         if not isinstance(item, dict):
             continue
-        for c in item.get("content", []) if isinstance(item.get("content", []), list) else []:
+        content = item.get("content", [])
+        if not isinstance(content, list):
+            continue
+        for c in content:
             if isinstance(c, dict) and c.get("type") in ("output_text", "text") and "text" in c:
                 chunks.append(str(c["text"]))
 
@@ -135,7 +135,7 @@ def _send_signal_telegram(symbols: List[str], title: str, note: str):
             "suggestion": title,
             "target": "",
             "stop": "",
-            "note": note[:3500],  # safety para Telegram
+            "note": (note or "")[:3500],  # safety para Telegram
         },
     )
 
@@ -197,6 +197,9 @@ def agent_scan(
     # Tiempo y edad del dato
     now_et = datetime.now(tz=ZoneInfo("America/New_York"))
     age_sec = int((now_et - snap_time_et).total_seconds())
+    if age_sec < 0:
+        # si por cualquier razón el reloj/parse genera futuro, clamp para no romper semáforo
+        age_sec = 0
     in_rth = _is_rth(snap_time_et)  # ✅ usa la hora REAL del dato
 
     # Semáforo
@@ -238,8 +241,10 @@ def agent_scan(
             "note": base_ctx,
         }
 
-    # GREEN (o YELLOW con force_analysis=1): pedir análisis a OpenAI si está habilitado
-    if OPENAI_ENABLED and OPENAI_API_KEY:
+    # GREEN (o YELLOW con force_analysis=1): pedir análisis a OpenAI si hay key y está habilitado o forzado
+    wants_openai = bool(OPENAI_API_KEY) and (OPENAI_ENABLED or force_analysis == 1)
+
+    if wants_openai:
         prompt = (
             "Eres BDV OPCIONES LIVE. Analiza SIN operar.\n"
             "Reglas duras:\n"
@@ -276,7 +281,7 @@ def agent_scan(
         }
 
     # Sin OpenAI: solo manda estado
-    _send_signal_telegram(symbols, "GREEN: DATA OK", base_ctx)
+    _send_signal_telegram(symbols, "GREEN: DATA OK" if light == "green" else "YELLOW: DATA OK", base_ctx)
     return {
         "status": "ok",
         "light": light,
