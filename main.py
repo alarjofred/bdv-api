@@ -1,5 +1,4 @@
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
 from pydantic import BaseModel
@@ -22,7 +21,6 @@ APCA_TRADING_URL = os.getenv("APCA_TRADING_URL", "https://paper-api.alpaca.marke
 # ✅ DISCO PERSISTENTE (Render Disk)
 PERSIST_DIR = os.getenv("PERSIST_DIR", "/data")
 os.makedirs(PERSIST_DIR, exist_ok=True)
-
 TRADES_LOG_FILE = os.path.join(PERSIST_DIR, "trades-log.jsonl")
 
 
@@ -114,9 +112,7 @@ app.include_router(config_router)
 app.include_router(monitor_router)
 app.include_router(signals_ai_router)
 app.include_router(alpaca_close_router)
-
 app.include_router(agent_router)  # ✅ AGENTE
-
 app.include_router(trade.router)
 app.include_router(telegram_notify.router)
 app.include_router(pending_trades.router)
@@ -176,23 +172,6 @@ def market_snapshot():
     except Exception as e:
         print(f"[ERR] /snapshot: {e}")
         raise HTTPException(status_code=500, detail=f"Error getting snapshot: {e}")
-
-
-# ---------------------------------
-# Endpoint /recommend (placeholder)
-# ---------------------------------
-@app.get("/recommend")
-def recommend():
-    data = {
-        "status": "ok",
-        "recommendations": [
-            {"symbol": "QQQ", "price": 0, "bias": "neutral", "suggestion": "wait", "target": 0, "stop": 0},
-            {"symbol": "SPY", "price": 0, "bias": "neutral", "suggestion": "wait", "target": 0, "stop": 0},
-            {"symbol": "NVDA", "price": 0, "bias": "neutral", "suggestion": "wait", "target": 0, "stop": 0},
-        ],
-        "note": "Endpoint placeholder. Usa /snapshot + /analysis/* para datos reales.",
-    }
-    return JSONResponse(content=data)
 
 
 # ---------------------------------
