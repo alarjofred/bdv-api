@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
 from pydantic import BaseModel
@@ -15,8 +16,15 @@ load_dotenv()
 
 APCA_API_KEY_ID = os.getenv("APCA_API_KEY_ID")
 APCA_API_SECRET_KEY = os.getenv("APCA_API_SECRET_KEY")
-APCA_DATA_URL = os.getenv("APCA_DATA_URL", "https://data.alpaca.markets/v2")
-APCA_TRADING_URL = os.getenv("APCA_TRADING_URL", "https://paper-api.alpaca.markets/v2")
+
+APCA_DATA_URL = os.getenv("APCA_DATA_URL", "https://data.alpaca.markets/v2").rstrip("/")
+
+# Normaliza TRADING_URL para que siempre use /v2
+_raw_trading = os.getenv("APCA_TRADING_URL", "https://paper-api.alpaca.markets").rstrip("/")
+if _raw_trading.endswith("/v2"):
+    APCA_TRADING_URL = _raw_trading
+else:
+    APCA_TRADING_URL = f"{_raw_trading}/v2"
 
 # ✅ DISCO PERSISTENTE (Render Disk)
 PERSIST_DIR = os.getenv("PERSIST_DIR", "/data")
@@ -43,7 +51,7 @@ def alpaca_headers() -> dict:
 
 
 # ---------------------------------
-# IMPORT DE ROUTERS (con protección)
+# IMPORT DE ROUTERS
 # ---------------------------------
 from routes.test_alpaca import router as test_alpaca_router
 from routes.recommend import router as recommend_router
@@ -52,7 +60,7 @@ from routes.config import router as config_router
 from routes.monitor import router as monitor_router
 from routes.signals_ai import router as signals_ai_router
 from routes.alpaca_close import router as alpaca_close_router
-from routes.agent import router as agent_router  # ✅ AGENTE
+from routes.agent import router as agent_router  # ✅ routes/agent.py (correcto)
 from routes import trade
 from routes import telegram_notify
 from routes import pending_trades
@@ -94,6 +102,8 @@ def root():
         "message": "alive",
         "alpaca_keys_loaded": has_alpaca_keys(),
         "persist_dir": PERSIST_DIR,
+        "apca_data_url": APCA_DATA_URL,
+        "apca_trading_url": APCA_TRADING_URL,
     }
 
 
