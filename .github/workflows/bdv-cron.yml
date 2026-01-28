@@ -1,0 +1,26 @@
+name: BDV Cron (scan + monitor)
+
+on:
+  schedule:
+    - cron: "* * * * *"   # cada minuto (GitHub puede agrupar si hay mucho tráfico)
+  workflow_dispatch: {}
+
+jobs:
+  bdv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Call /agent/scan
+        run: |
+          curl -sS "${{ secrets.BDV_BASE_URL }}/agent/scan?force_analysis=0" \
+            -H "accept: application/json" \
+            -H "x-bdv-secret: ${{ secrets.BDV_AGENT_SECRET }}" \
+            | head -c 2000
+
+      - name: Call /monitor/tick
+        run: |
+          curl -sS "${{ secrets.BDV_BASE_URL }}/monitor/tick" \
+            -H "accept: application/json" \
+            -H "x-bdv-secret: ${{ secrets.BDV_AGENT_SECRET }}" \
+            | head -c 2000
