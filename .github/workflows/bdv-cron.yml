@@ -2,7 +2,7 @@ name: BDV Cron (scan + monitor)
 
 on:
   schedule:
-    - cron: "* * * * *"   # cada minuto (GitHub puede agrupar si hay mucho tráfico)
+    - cron: "*/5 * * * *"
   workflow_dispatch: {}
 
 jobs:
