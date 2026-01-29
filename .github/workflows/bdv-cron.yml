@@ -11,16 +11,36 @@ jobs:
     timeout-minutes: 5
 
     steps:
+      - name: Force AUTO execution mode (and log config)
+        run: |
+          set -euo pipefail
+          echo "Setting execution_mode=auto..."
+          curl --fail-with-body -sS -X POST "${{ secrets.BDV_BASE_URL }}/config/execution-mode" \
+            -H "accept: application/json" \
+            -H "content-type: application/json" \
+            -H "x-bdv-secret: ${{ secrets.BDV_AGENT_SECRET }}" \
+            -d '{"mode":"auto"}' | head -c 2000
+          echo
+          echo "Config status:"
+          curl --fail-with-body -sS "${{ secrets.BDV_BASE_URL }}/config/status" \
+            -H "accept: application/json" \
+            -H "x-bdv-secret: ${{ secrets.BDV_AGENT_SECRET }}" | head -c 2000
+          echo
+
       - name: Call /agent/scan
         run: |
-          curl -sS "${{ secrets.BDV_BASE_URL }}/agent/scan?force_analysis=0" \
+          set -euo pipefail
+          curl --fail-with-body -sS "${{ secrets.BDV_BASE_URL }}/agent/scan?force_analysis=0" \
             -H "accept: application/json" \
             -H "x-bdv-secret: ${{ secrets.BDV_AGENT_SECRET }}" \
             | head -c 2000
+          echo
 
       - name: Call /monitor/tick
         run: |
-          curl -sS "${{ secrets.BDV_BASE_URL }}/monitor/tick" \
+          set -euo pipefail
+          curl --fail-with-body -sS "${{ secrets.BDV_BASE_URL }}/monitor/tick" \
             -H "accept: application/json" \
             -H "x-bdv-secret: ${{ secrets.BDV_AGENT_SECRET }}" \
             | head -c 2000
+          echo
