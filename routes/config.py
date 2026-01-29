@@ -1,7 +1,7 @@
 from enum import Enum
-from typing import Optional, Set
+from typing import Any, Optional
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Body, HTTPException, Query, Request
 from pydantic import BaseModel
 
 router = APIRouter(prefix="/config", tags=["config"])
@@ -39,70 +39,70 @@ def _sync_max_trades() -> None:
     config_state.max_trades_per_day = int(MAX_TRADES_BY_RISK.get(config_state.risk_mode, 1))
 
 
-def _normalize_mode_str(value: str) -> str:
-    return value.strip().lower()
+def _norm(v: str) -> str:
+    return v.strip().lower()
 
 
 async def _extract_mode(
     request: Request,
     query_mode: Optional[str],
-    dict_key_primary: str,
-    dict_key_alt: str,
-    allowed: Set[str],
+    body_obj: Any,
+    primary_key: str,
+    alt_key: str,
+    allowed: set[str],
 ) -> str:
-    """
-    Extrae modo desde:
-      1) Query param (?mode=auto)  <-- lo más robusto para GitHub Actions
-      2) Body raw (JSON dict {"mode":"auto"} o {"execution_mode":"auto"} o string "auto")
-      3) Body raw sin JSON (auto/manual)
-    IMPORTANTE: NO usamos Body(...) para evitar 422 json_invalid antes de entrar al endpoint.
-    """
-
-    # 1) querystring (preferido)
+    # 1) Querystring (lo más robusto para cron)
     if query_mode:
-        m = _normalize_mode_str(str(query_mode))
+        m = _norm(str(query_mode))
         if m in allowed:
             return m
 
-    # 2) raw body fallback (solo si existe)
+    # 2) Body ya parseado (dict / str)
+    if isinstance(body_obj, dict):
+        v = body_obj.get(primary_key) or body_obj.get(alt_key)
+        if v is not None:
+            m = _norm(str(v))
+            if m in allowed:
+                return m
+
+    if isinstance(body_obj, str):
+        m = _norm(body_obj)
+        if m in allowed:
+            return m
+
+    # 3) Raw body fallback (si vino vacío / raro / no-JSON)
     raw = await request.body()
     if raw:
         text = raw.decode("utf-8", errors="ignore").strip()
 
-        # Caso: body es un string simple: auto
-        if text and text[0] != "{":
-            m = _normalize_mode_str(text.strip('"').strip("'"))
+        # raw: auto
+        if text and not text.startswith("{") and not text.startswith("["):
+            m = _norm(text.strip('"').strip("'"))
             if m in allowed:
                 return m
 
-        # Caso: JSON
+        # JSON dict o JSON string
         try:
             import json
 
             parsed = json.loads(text)
-
             if isinstance(parsed, dict):
-                v = parsed.get(dict_key_primary) or parsed.get(dict_key_alt)
+                v = parsed.get(primary_key) or parsed.get(alt_key)
                 if v is not None:
-                    m = _normalize_mode_str(str(v))
+                    m = _norm(str(v))
                     if m in allowed:
                         return m
-
             elif isinstance(parsed, str):
-                m = _normalize_mode_str(parsed)
+                m = _norm(parsed)
                 if m in allowed:
                     return m
-
         except Exception:
-            # Si el JSON viene roto, NO explotamos; seguimos a error controlado.
             pass
 
     raise HTTPException(
         status_code=422,
-        detail=(
-            f"mode is required and must be one of: {sorted(list(allowed))}. "
-            f"Send ?mode=... or JSON body."
-        ),
+        detail=f"mode is required and must be one of: {sorted(list(allowed))}. "
+               f"Use ?mode=... or JSON body."
     )
 
 
@@ -116,15 +116,14 @@ def get_config_status() -> ConfigStatus:
 async def set_execution_mode(
     request: Request,
     mode: Optional[str] = Query(default=None),
+    payload: Any = Body(default=None),
 ) -> ConfigStatus:
-    # Acepta:
-    #  - /config/execution-mode?mode=auto (recomendado)
-    #  - body {"mode":"auto"} o {"execution_mode":"auto"} o "auto"
     m = await _extract_mode(
         request=request,
         query_mode=mode,
-        dict_key_primary="mode",
-        dict_key_alt="execution_mode",
+        body_obj=payload,
+        primary_key="mode",
+        alt_key="execution_mode",
         allowed={"auto", "manual"},
     )
     config_state.execution_mode = ExecutionMode(m)
@@ -136,15 +135,14 @@ async def set_execution_mode(
 async def set_risk_mode(
     request: Request,
     mode: Optional[str] = Query(default=None),
+    payload: Any = Body(default=None),
 ) -> ConfigStatus:
-    # Acepta:
-    #  - /config/risk-mode?mode=low|medium|high (recomendado)
-    #  - body {"mode":"low"} o {"risk_mode":"low"} o "low"
     m = await _extract_mode(
         request=request,
         query_mode=mode,
-        dict_key_primary="mode",
-        dict_key_alt="risk_mode",
+        body_obj=payload,
+        primary_key="mode",
+        alt_key="risk_mode",
         allowed={"low", "medium", "high"},
     )
     config_state.risk_mode = RiskMode(m)
