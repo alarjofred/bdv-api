@@ -2,7 +2,8 @@ name: BDV Cron (scan + monitor)
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    # Corre L-V cada 5 min. El "gate" real lo hace in_rth (evita DST/UTC headaches)
+    - cron: "*/5 * * * 1-5"
   workflow_dispatch: {}
 
 jobs:
@@ -27,8 +28,6 @@ jobs:
             echo "===== ${label} ====="
             echo "${method} ${url}"
 
-            # Nota: --fail-with-body hace que curl salga !=0 en 4xx/5xx,
-            # pero igual guardamos headers/body para debug.
             curl -sS --fail-with-body \
               --retry 5 --retry-delay 2 --retry-all-errors \
               --connect-timeout 5 --max-time 25 \
@@ -51,7 +50,6 @@ jobs:
             head -c 2000 "${out_body}" || true
             echo
 
-            # Safety: si por alguna razón curl no falló pero code != 200, cortamos aquí.
             if [[ "${code}" != "200" ]]; then
               echo "ERROR: ${label} returned HTTP ${code}"
               exit 1
@@ -69,7 +67,8 @@ jobs:
           hit "config status (after)" "GET" "${BASE}/config/status" \
             "/tmp/headers_status2.txt" "/tmp/body_status2.txt" "/tmp/code_status2.txt"
 
-      - name: Call /agent/scan
+      - name: Call /agent/scan (gatekeeper: decide if in RTH)
+        id: scan
         shell: bash
         run: |
           set -euo pipefail
@@ -85,7 +84,8 @@ jobs:
             -H "x-bdv-secret: ${{ secrets.BDV_AGENT_SECRET }}" \
             -w "%{http_code}" > /tmp/code_scan.txt
 
-          echo "HTTP $(cat /tmp/code_scan.txt || true)"
+          code="$(cat /tmp/code_scan.txt || true)"
+          echo "HTTP ${code}"
           echo "---- headers (scan) ----"
           head -c 2000 /tmp/headers_scan.txt || true
           echo
@@ -93,12 +93,44 @@ jobs:
           head -c 2000 /tmp/body_scan.txt || true
           echo
 
-          if [[ "$(cat /tmp/code_scan.txt || true)" != "200" ]]; then
-            echo "ERROR: /agent/scan returned non-200"
+          if [[ "${code}" != "200" ]]; then
+            echo "ERROR: /agent/scan returned HTTP ${code}"
             exit 1
           fi
 
-      - name: Call /monitor/tick
+          # Parse JSON safely with python (no depende de jq)
+          python - <<'PY'
+          import json, sys
+          p = "/tmp/body_scan.txt"
+          try:
+            data = json.load(open(p, "r", encoding="utf-8"))
+          except Exception as e:
+            print(f"FAILED parsing scan JSON: {e}")
+            sys.exit(1)
+
+          in_rth = bool(data.get("in_rth", False))
+          status = str(data.get("status", "")).lower()
+          reason = str(data.get("reason", ""))
+
+          # Export outputs for next steps
+          with open(sys.argv[1], "a", encoding="utf-8") as f:
+            f.write(f"in_rth={'true' if in_rth else 'false'}\n")
+            f.write(f"scan_status={status}\n")
+
+          print("Parsed:")
+          print("  in_rth:", in_rth)
+          print("  status:", status)
+          print("  reason:", reason)
+          PY "$GITHUB_OUTPUT"
+
+          # Si NO está en RTH -> termina OK (sin fallar)
+          if [[ "${{ steps.scan.outputs.in_rth }}" != "true" ]]; then
+            echo "Outside RTH (in_rth=false). Exiting SUCCESS (no monitor/tick)."
+            exit 0
+          fi
+
+      - name: Call /monitor/tick (ONLY if in RTH)
+        if: steps.scan.outputs.in_rth == 'true'
         shell: bash
         run: |
           set -euo pipefail
