@@ -12,6 +12,7 @@ jobs:
 
     steps:
       - name: Ensure AUTO execution mode (and log config)
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -19,29 +20,30 @@ jobs:
           curl --fail-with-body -sS --retry 3 --retry-delay 2 --retry-all-errors \
             "${{ secrets.BDV_BASE_URL }}/config/status" \
             -H "accept: application/json" \
-            -H "x-bdv-secret: ${{ secrets.BDV_AGENT_SECRET }}" \
-            | head -c 2000
+            -H "x-bdv-secret: ${{ secrets.BDV_AGENT_SECRET }}"
+          echo
           echo
 
           echo "Setting execution_mode=auto..."
+          BODY="$(jq -nc --arg mode "auto" '{mode:$mode}')"
           curl --fail-with-body -sS --retry 3 --retry-delay 2 --retry-all-errors \
             -X POST "${{ secrets.BDV_BASE_URL }}/config/execution-mode" \
             -H "accept: application/json" \
             -H "Content-Type: application/json" \
             -H "x-bdv-secret: ${{ secrets.BDV_AGENT_SECRET }}" \
-            --data-binary '{"mode":"auto"}' \
-            | head -c 2000
+            --data-binary "$BODY"
+          echo
           echo
 
           echo "Re-check config status..."
           curl --fail-with-body -sS --retry 3 --retry-delay 2 --retry-all-errors \
             "${{ secrets.BDV_BASE_URL }}/config/status" \
             -H "accept: application/json" \
-            -H "x-bdv-secret: ${{ secrets.BDV_AGENT_SECRET }}" \
-            | head -c 2000
+            -H "x-bdv-secret: ${{ secrets.BDV_AGENT_SECRET }}"
           echo
 
       - name: Call /agent/scan
+        shell: bash
         run: |
           set -euo pipefail
           curl --fail-with-body -sS --retry 3 --retry-delay 2 --retry-all-errors \
@@ -52,6 +54,7 @@ jobs:
           echo
 
       - name: Call /monitor/tick
+        shell: bash
         run: |
           set -euo pipefail
           curl --fail-with-body -sS --retry 3 --retry-delay 2 --retry-all-errors \
