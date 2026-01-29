@@ -19,7 +19,8 @@ jobs:
           curl --fail-with-body -sS --retry 3 --retry-delay 2 --retry-all-errors \
             "${{ secrets.BDV_BASE_URL }}/config/status" \
             -H "accept: application/json" \
-            -H "x-bdv-secret: ${{ secrets.BDV_AGENT_SECRET }}" | head -c 2000
+            -H "x-bdv-secret: ${{ secrets.BDV_AGENT_SECRET }}" \
+            | head -c 2000
           echo
 
           echo "Setting execution_mode=auto..."
@@ -28,16 +29,16 @@ jobs:
             -H "accept: application/json" \
             -H "Content-Type: application/json" \
             -H "x-bdv-secret: ${{ secrets.BDV_AGENT_SECRET }}" \
-            -d @- <<'JSON' | head -c 2000
-          {"mode":"auto"}
-          JSON
+            --data-binary '{"mode":"auto"}' \
+            | head -c 2000
           echo
 
           echo "Re-check config status..."
           curl --fail-with-body -sS --retry 3 --retry-delay 2 --retry-all-errors \
             "${{ secrets.BDV_BASE_URL }}/config/status" \
             -H "accept: application/json" \
-            -H "x-bdv-secret: ${{ secrets.BDV_AGENT_SECRET }}" | head -c 2000
+            -H "x-bdv-secret: ${{ secrets.BDV_AGENT_SECRET }}" \
+            | head -c 2000
           echo
 
       - name: Call /agent/scan
