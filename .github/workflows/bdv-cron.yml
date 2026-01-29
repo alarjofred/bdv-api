@@ -21,7 +21,9 @@ jobs:
             -H "accept: application/json" \
             -H "Content-Type: application/json" \
             -H "x-bdv-secret: ${{ secrets.BDV_AGENT_SECRET }}" \
-            -d '{"mode":"auto"}' | head -c 2000
+            --data-binary @- <<'JSON' | head -c 2000
+          {"mode":"auto"}
+          JSON
 
           echo
           echo "Config status:"
