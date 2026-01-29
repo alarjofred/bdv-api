@@ -25,13 +25,12 @@ jobs:
           echo
 
           echo "Setting execution_mode=auto..."
-          BODY="$(jq -nc --arg mode "auto" '{mode:$mode}')"
-          curl --fail-with-body -sS --retry 3 --retry-delay 2 --retry-all-errors \
+          printf '%s' '{"mode":"auto"}' | curl --fail-with-body -sS --retry 3 --retry-delay 2 --retry-all-errors \
             -X POST "${{ secrets.BDV_BASE_URL }}/config/execution-mode" \
             -H "accept: application/json" \
             -H "Content-Type: application/json" \
             -H "x-bdv-secret: ${{ secrets.BDV_AGENT_SECRET }}" \
-            --data-binary "$BODY"
+            --data-binary @-
           echo
           echo
 
