@@ -11,7 +11,7 @@ jobs:
     timeout-minutes: 5
 
     steps:
-      - name: BDV run (RTH-aware, robust, no curl23)
+      - name: BDV run (RTH-aware, robust)
         shell: bash
         run: |
           set -u
@@ -24,19 +24,13 @@ jobs:
             exit 1
           fi
 
-          # --- RTH check using America/New_York (handles DST automatically) ---
           IN_RTH_WINDOW="$(python3 - <<'PY'
 from datetime import datetime, time
-try:
-    from zoneinfo import ZoneInfo
-except Exception:
-    print("0"); raise
+from zoneinfo import ZoneInfo
 ny = ZoneInfo("America/New_York")
 now = datetime.now(ny)
-# Lun-Vie
 if now.weekday() > 4:
     print("0"); raise SystemExit
-# 09:30 to 16:00
 start = time(9,30)
 end   = time(16,0)
 print("1" if (start <= now.time() <= end) else "0")
@@ -51,16 +45,11 @@ PY
             local method="$1"
             local url="$2"
             local out="$3"
-            local hdr="$4"
 
             echo "==> $method $url"
-
-            # capturamos HTTP sin spamear salida
-            local http="000"
             http=$(curl -sS -L --connect-timeout 10 --max-time 20 \
               --retry 5 --retry-delay 2 --retry-all-errors \
               -X "$method" \
-              -D "$hdr" \
               -o "$out" \
               -H "accept: application/json" \
               -H "x-bdv-secret: $SECRET" \
@@ -68,54 +57,35 @@ PY
               "$url" 2>/dev/null || echo "000")
 
             echo "HTTP $http"
-            echo "-- body (first 800 chars) --"
-            head -c 800 "$out" || true
+            echo "-- body (first 600 chars) --"
+            head -c 600 "$out" || true
             echo
-
             echo "$http"
           }
 
-          # 1) status
-          code="$(call GET "$BASE/config/status" /tmp/status.json /tmp/status.hdr)"
-          if [[ "$code" != "200" ]]; then
-            echo "FAIL (RTH): /config/status HTTP $code"
-            exit 1
-          fi
+          code="$(call GET "$BASE/config/status" /tmp/status.json)"
+          [[ "$code" == "200" ]] || { echo "FAIL: /config/status"; exit 1; }
 
-          # 2) force auto
-          code="$(call POST "$BASE/config/execution-mode?mode=auto" /tmp/set_auto.json /tmp/set_auto.hdr)"
-          if [[ "$code" != "200" ]]; then
-            echo "FAIL (RTH): /config/execution-mode HTTP $code"
-            exit 1
-          fi
+          code="$(call POST "$BASE/config/execution-mode?mode=auto" /tmp/set_auto.json)"
+          [[ "$code" == "200" ]] || { echo "FAIL: /config/execution-mode"; exit 1; }
 
-          # 3) scan
-          code="$(call GET "$BASE/agent/scan?force_analysis=0" /tmp/scan.json /tmp/scan.hdr)"
-          if [[ "$code" != "200" ]]; then
-            echo "FAIL (RTH): /agent/scan HTTP $code"
-            exit 1
-          fi
+          code="$(call GET "$BASE/agent/scan?force_analysis=0" /tmp/scan.json)"
+          [[ "$code" == "200" ]] || { echo "FAIL: /agent/scan"; exit 1; }
 
-          # Si scan dice que no es operable, NO fallamos (porque puede ser stale)
           OPERABLE="$(python3 - <<'PY'
 import json
 d=json.load(open("/tmp/scan.json","r",encoding="utf-8"))
 status=str(d.get("status","")).lower()
 in_rth=bool(d.get("in_rth", False))
-# Solo ejecuta tick si scan está green/ok y in_rth true
 print("1" if (in_rth and status in ("green","ok")) else "0")
 PY
 )"
           if [[ "$OPERABLE" != "1" ]]; then
-            echo "Scan says NOT operable (even inside time window). Exit GREEN."
+            echo "Scan NOT operable -> Exit GREEN."
             exit 0
           fi
 
-          # 4) tick
-          code="$(call GET "$BASE/monitor/tick" /tmp/tick.json /tmp/tick.hdr)"
-          if [[ "$code" != "200" ]]; then
-            echo "FAIL (RTH): /monitor/tick HTTP $code"
-            exit 1
-          fi
+          code="$(call GET "$BASE/monitor/tick" /tmp/tick.json)"
+          [[ "$code" == "200" ]] || { echo "FAIL: /monitor/tick"; exit 1; }
 
-          echo "DONE OK (RTH)."
+          echo "DONE OK."
