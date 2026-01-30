@@ -2,7 +2,7 @@ name: BDV Cron
 
 on:
   schedule:
-    - cron: "*/5 * * * 1-5"   # cada 5 min, lun-vie (weekends ya quedan fuera)
+    - cron: "*/5 * * * 1-5"   # cada 5 min, lun-vie (UTC). El guard decide por ET.
   workflow_dispatch:
 
 jobs:
@@ -16,6 +16,9 @@ jobs:
           API_KEY: ${{ secrets.BDV_API_KEY }}
         run: |
           set -euo pipefail
+
+          sudo apt-get update -y
+          sudo apt-get install -y jq
 
           TZ="America/New_York"
           dow=$(TZ=$TZ date +%u)         # 1..7 (Mon..Sun)
@@ -40,15 +43,22 @@ jobs:
 
           echo "Inside RTH: now=$hhmm NY -> running endpoints"
 
+          get_json() {
+            local path="$1"
+            local url="${BASE_URL}${path}"
+            curl -sS \
+              -H "Authorization: Bearer ${API_KEY}" \
+              -H "Content-Type: application/json" \
+              --connect-timeout 5 --max-time 20 \
+              "$url"
+          }
+
           call() {
             local path="$1"
             local url="${BASE_URL}${path}"
             local tmp_body
             tmp_body="$(mktemp)"
 
-            # -sS: silencioso pero muestra errores
-            # -o body: no imprime html a consola
-            # -w: captura http_code
             http_code=$(
               curl -sS -o "$tmp_body" -w "%{http_code}" \
                 -H "Authorization: Bearer ${API_KEY}" \
@@ -57,7 +67,6 @@ jobs:
                 "$url" || echo "000"
             )
 
-            # snippet controlado (primeros 300 chars, sin “basura infinita”)
             snippet=$(head -c 300 "$tmp_body" | tr '\n' ' ' | sed 's/  */ /g')
             rm -f "$tmp_body"
 
@@ -69,24 +78,32 @@ jobs:
             fi
           }
 
-          # Orden que pediste
-          # 1) intenta activar auto
-call "/config/status?set=auto"
+          # 1) Intentar activar auto
+          call "/config/status?set=auto"
 
-# 2) valida que realmente quedó en auto
-cfg="$(get_json "/config/status")"
-mode="$(echo "$cfg" | jq -r '.execution_mode // empty')"
+          # 2) Verificar que realmente quedó en auto (si no, FAIL)
+          cfg="$(get_json "/config/status")"
+          mode="$(echo "$cfg" | jq -r '.execution_mode // empty')"
+          echo "CHECK execution_mode after set=auto -> ${mode}"
 
-echo "CHECK execution_mode after set=auto -> ${mode}"
+          if [ "$mode" != "auto" ]; then
+            echo "FAIL: execution_mode did not switch to auto."
+            echo "CFG_SNIPPET: $(echo "$cfg" | head -c 400 | tr '\n' ' ')"
+            exit 1
+          fi
 
-if [ "$mode" != "auto" ]; then
-  echo "FAIL: execution_mode did not switch to auto."
-  echo "CFG_SNIPPET: $(echo "$cfg" | head -c 400 | tr '\n' ' ')"
-  exit 1
-fi
+          # 3) Continuar operación
+          call "/agent/scan"
 
-# 3) continúa solo si está en auto
-call "/agent/scan"
-call "/monitor/tick"
+          # 4) Tick con verificación adicional (si responde skipped, FAIL)
+          tick="$(get_json "/monitor/tick")"
+          tstatus="$(echo "$tick" | jq -r '.status // empty')"
+          treason="$(echo "$tick" | jq -r '.reason // empty')"
+          echo "CHECK monitor/tick -> status=${tstatus} reason=${treason}"
 
-          echo "All endpoints OK inside RTH."
+          if [ "$tstatus" = "skipped" ]; then
+            echo "FAIL: monitor/tick skipped inside RTH -> ${treason}"
+            exit 1
+          fi
+
+          echo "All checks OK inside RTH."
