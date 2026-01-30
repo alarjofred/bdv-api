@@ -2,12 +2,9 @@ name: BDV Cron (scan + monitor)
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    # Ventana amplia en UTC para cubrir 9-4 ET aprox (y DST). El backend decide in_rth.
+    - cron: "*/5 13-21 * * 1-5"
   workflow_dispatch:
-
-concurrency:
-  group: bdv-cron
-  cancel-in-progress: true
 
 jobs:
   bdv:
@@ -15,81 +12,99 @@ jobs:
     timeout-minutes: 5
 
     steps:
-      - name: Ensure AUTO execution mode + log config (robust)
+      - name: Ensure AUTO execution mode + run scan/monitor (safe outside RTH)
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "Checking config status..."
-          curl -sS --retry 5 --retry-delay 2 --retry-all-errors --max-time 20 \
-            -D /tmp/headers_status.txt \
-            -o /tmp/body_status.txt \
-            "${{ secrets.BDV_BASE_URL }}/config/status" \
-            -H "accept: application/json" \
-            -H "x-bdv-secret: ${{ secrets.BDV_AGENT_SECRET }}" \
-            -w "\nHTTP %{http_code}\n"
+          BASE="${{ secrets.BDV_BASE_URL }}"
+          SECRET="${{ secrets.BDV_AGENT_SECRET }}"
 
-          echo "---- body (status) ----"
-          head -c 2000 /tmp/body_status.txt || true
-          echo
+          call() {
+            local method="$1"
+            local url="$2"
+            local out="$3"
+            local headers="$4"
 
-          echo "Setting execution_mode=auto via querystring..."
-          curl -sS --retry 5 --retry-delay 2 --retry-all-errors --max-time 20 \
-            -D /tmp/headers_set.txt \
-            -o /tmp/body_set.txt \
-            -X POST "${{ secrets.BDV_BASE_URL }}/config/execution-mode?mode=auto" \
-            -H "accept: application/json" \
-            -H "x-bdv-secret: ${{ secrets.BDV_AGENT_SECRET }}" \
-            -w "\nHTTP %{http_code}\n"
+            echo "==> $method $url"
+            # Guardamos body y headers SIEMPRE (evita curl 23 y te deja logs)
+            http_code=$(curl -sS --retry 5 --retry-delay 2 --retry-all-errors --max-time 20 \
+              -X "$method" \
+              -D "$headers" \
+              -o "$out" \
+              -H "accept: application/json" \
+              -H "x-bdv-secret: $SECRET" \
+              -w "%{http_code}" \
+              "$url" || true)
 
-          echo "---- body (set) ----"
-          head -c 2000 /tmp/body_set.txt || true
-          echo
+            echo "HTTP $http_code"
+            echo "-- headers (first 80 lines) --"
+            sed -n '1,80p' "$headers" || true
+            echo "-- body (first 2000 chars) --"
+            head -c 2000 "$out" || true
+            echo
+            echo "$http_code"
+          }
 
-      - name: Scan + conditional monitor (skip if out of RTH)
-        shell: bash
-        run: |
-          set -euo pipefail
+          # 1) Status (si falla aquí, sí queremos enterarnos)
+          code=$(call GET "$BASE/config/status" /tmp/status.json /tmp/status.hdr)
+          if [[ "$code" != "200" ]]; then
+            echo "ERROR: /config/status returned HTTP $code"
+            exit 1
+          fi
 
-          echo "Calling /agent/scan..."
-          # NO usamos --fail-with-body aquí porque fuera de RTH puede devolver status yellow y eso NO debe romper.
-          curl -sS --retry 5 --retry-delay 2 --retry-all-errors --max-time 20 \
-            -o /tmp/body_scan.txt \
-            "${{ secrets.BDV_BASE_URL }}/agent/scan?force_analysis=0" \
-            -H "accept: application/json" \
-            -H "x-bdv-secret: ${{ secrets.BDV_AGENT_SECRET }}" \
-            -w "\nHTTP %{http_code}\n" || true
+          # 2) Set AUTO via querystring (definitivo)
+          code=$(call POST "$BASE/config/execution-mode?mode=auto" /tmp/set_auto.json /tmp/set_auto.hdr)
+          if [[ "$code" != "200" ]]; then
+            echo "ERROR: /config/execution-mode returned HTTP $code"
+            exit 1
+          fi
 
-          echo "---- body (scan) ----"
-          head -c 2000 /tmp/body_scan.txt || true
-          echo
+          # 3) Scan (NO fallar fuera de RTH)
+          code=$(call GET "$BASE/agent/scan?force_analysis=0" /tmp/scan.json /tmp/scan.hdr)
+          if [[ "$code" != "200" ]]; then
+            echo "ERROR: /agent/scan returned HTTP $code"
+            exit 1
+          fi
 
-          # Parse JSON para leer in_rth y decidir
-          IN_RTH="$(python3 - <<'PY'
-import json
-p="/tmp/body_scan.txt"
-try:
-    d=json.load(open(p))
-    print("true" if d.get("in_rth") else "false")
-except Exception:
-    print("false")
-PY
-)"
-          echo "in_rth=$IN_RTH"
+          # Si in_rth=false => salimos OK (no marcar failure)
+          python3 - <<'PY'
+          import json, sys
+          p = "/tmp/scan.json"
+          with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
 
-          if [ "$IN_RTH" != "true" ]; then
-            echo "Outside RTH -> skipping /monitor/tick (exit 0)"
+          in_rth = bool(data.get("in_rth", False))
+          status = str(data.get("status", "")).lower()
+          reason = data.get("reason")
+
+          print(f"[scan] in_rth={in_rth} status={status} reason={reason}")
+
+          # Fuera de RTH: éxito silencioso
+          if not in_rth:
+            sys.exit(0)
+
+          # Dentro de RTH pero semáforo no está ok/green: no reventar el workflow (solo no operar)
+          # Ajusta si quieres que 'yellow' dentro de RTH sea failure.
+          if status not in ("ok", "green"):
+            sys.exit(0)
+
+          sys.exit(1)  # señal para continuar al tick usando bash
+          PY
+
+          pycode=$?
+          if [[ "$pycode" == "0" ]]; then
+            echo "Outside RTH OR not operable now -> exit 0 (no failure)."
             exit 0
           fi
 
-          echo "In RTH -> calling /monitor/tick..."
-          curl -sS --retry 5 --retry-delay 2 --retry-all-errors --max-time 20 \
-            -o /tmp/body_tick.txt \
-            "${{ secrets.BDV_BASE_URL }}/monitor/tick" \
-            -H "accept: application/json" \
-            -H "x-bdv-secret: ${{ secrets.BDV_AGENT_SECRET }}" \
-            -w "\nHTTP %{http_code}\n"
+          echo "In RTH and operable -> running /monitor/tick..."
 
-          echo "---- body (tick) ----"
-          head -c 2000 /tmp/body_tick.txt || true
-          echo
+          # 4) Tick (aquí sí: si falla, queremos verlo)
+          code=$(call GET "$BASE/monitor/tick" /tmp/tick.json /tmp/tick.hdr)
+          if [[ "$code" != "200" ]]; then
+            echo "ERROR: /monitor/tick returned HTTP $code"
+            exit 1
+          fi
+
+          echo "Done."
