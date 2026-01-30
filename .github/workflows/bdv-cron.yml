@@ -70,9 +70,23 @@ jobs:
           }
 
           # Orden que pediste
-          call "/config/status?set=auto"
-          call "/config/status"
-          call "/agent/scan"
-          call "/monitor/tick"
+          # 1) intenta activar auto
+call "/config/status?set=auto"
+
+# 2) valida que realmente quedó en auto
+cfg="$(get_json "/config/status")"
+mode="$(echo "$cfg" | jq -r '.execution_mode // empty')"
+
+echo "CHECK execution_mode after set=auto -> ${mode}"
+
+if [ "$mode" != "auto" ]; then
+  echo "FAIL: execution_mode did not switch to auto."
+  echo "CFG_SNIPPET: $(echo "$cfg" | head -c 400 | tr '\n' ' ')"
+  exit 1
+fi
+
+# 3) continúa solo si está en auto
+call "/agent/scan"
+call "/monitor/tick"
 
           echo "All endpoints OK inside RTH."
