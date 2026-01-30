@@ -2,8 +2,11 @@ name: BDV Cron (scan + monitor)
 
 on:
   schedule:
-    # Corre L-V cada 5 min. El "gate" real lo hace in_rth (evita DST/UTC headaches)
-    - cron: "*/5 * * * 1-5"
+    # PRO: GitHub cron usa UTC. Ponemos dos ventanas (EST/EDT) y el backend decide con in_rth.
+    # EST (invierno): 9:30–16:00 ET ≈ 14:30–21:00 UTC -> usamos 14-20 (cada 5 min) y gatekeeper filtra.
+    - cron: "*/5 14-20 * * 1-5"
+    # EDT (verano): 9:30–16:00 ET ≈ 13:30–20:00 UTC -> usamos 13-19 y gatekeeper filtra.
+    - cron: "*/5 13-19 * * 1-5"
   workflow_dispatch: {}
 
 jobs:
@@ -16,68 +19,44 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
-          hit () {
-            local label="$1"
-            local method="$2"
-            local url="$3"
-            local out_headers="$4"
-            local out_body="$5"
-            local out_code="$6"
-
-            echo "===== ${label} ====="
-            echo "${method} ${url}"
-
-            curl -sS --fail-with-body \
-              --retry 5 --retry-delay 2 --retry-all-errors \
-              --connect-timeout 5 --max-time 25 \
-              -X "${method}" \
-              -D "${out_headers}" \
-              -o "${out_body}" \
-              -H "accept: application/json" \
-              -H "x-bdv-secret: ${{ secrets.BDV_AGENT_SECRET }}" \
-              -w "%{http_code}" \
-              "${url}" > "${out_code}"
-
-            local code
-            code="$(cat "${out_code}" || true)"
-            echo "HTTP ${code}"
-
-            echo "---- headers (${label}) ----"
-            head -c 2000 "${out_headers}" || true
-            echo
-            echo "---- body (${label}) ----"
-            head -c 2000 "${out_body}" || true
-            echo
-
-            if [[ "${code}" != "200" ]]; then
-              echo "ERROR: ${label} returned HTTP ${code}"
-              exit 1
-            fi
-          }
-
           BASE="${{ secrets.BDV_BASE_URL }}"
 
-          hit "config status (before)" "GET"  "${BASE}/config/status" \
-            "/tmp/headers_status.txt" "/tmp/body_status.txt" "/tmp/code_status.txt"
+          echo "Checking config status..."
+          curl -sS --retry 5 --retry-delay 2 --retry-all-errors --connect-timeout 5 --max-time 25 \
+            -D /tmp/headers_status.txt \
+            -o /tmp/body_status.txt \
+            "${BASE}/config/status" \
+            -H "accept: application/json" \
+            -H "x-bdv-secret: ${{ secrets.BDV_AGENT_SECRET }}" \
+            -w "%{http_code}" > /tmp/code_status.txt
 
-          hit "set exec_mode=auto (querystring)" "POST" "${BASE}/config/execution-mode?mode=auto" \
-            "/tmp/headers_set.txt" "/tmp/body_set.txt" "/tmp/code_set.txt"
+          echo "HTTP $(cat /tmp/code_status.txt || true)"
+          echo "---- body (status) ----"
+          head -c 2000 /tmp/body_status.txt || true
+          echo
 
-          hit "config status (after)" "GET" "${BASE}/config/status" \
-            "/tmp/headers_status2.txt" "/tmp/body_status2.txt" "/tmp/code_status2.txt"
+          echo "Setting execution_mode=auto via querystring..."
+          curl -sS --retry 5 --retry-delay 2 --retry-all-errors --connect-timeout 5 --max-time 25 \
+            -D /tmp/headers_set.txt \
+            -o /tmp/body_set.txt \
+            -X POST "${BASE}/config/execution-mode?mode=auto" \
+            -H "accept: application/json" \
+            -H "x-bdv-secret: ${{ secrets.BDV_AGENT_SECRET }}" \
+            -w "%{http_code}" > /tmp/code_set.txt
 
-      - name: Call /agent/scan (gatekeeper: decide if in RTH)
+          echo "HTTP $(cat /tmp/code_set.txt || true)"
+          echo "---- body (set) ----"
+          head -c 2000 /tmp/body_set.txt || true
+          echo
+
+      - name: Call /agent/scan (gatekeeper: DO NOT FAIL outside RTH)
         id: scan
         shell: bash
         run: |
           set -euo pipefail
           BASE="${{ secrets.BDV_BASE_URL }}"
 
-          curl -sS --fail-with-body \
-            --retry 5 --retry-delay 2 --retry-all-errors \
-            --connect-timeout 5 --max-time 25 \
-            -D /tmp/headers_scan.txt \
+          curl -sS --retry 5 --retry-delay 2 --retry-all-errors --connect-timeout 5 --max-time 25 \
             -o /tmp/body_scan.txt \
             "${BASE}/agent/scan?force_analysis=0" \
             -H "accept: application/json" \
@@ -86,46 +65,24 @@ jobs:
 
           code="$(cat /tmp/code_scan.txt || true)"
           echo "HTTP ${code}"
-          echo "---- headers (scan) ----"
-          head -c 2000 /tmp/headers_scan.txt || true
-          echo
           echo "---- body (scan) ----"
           head -c 2000 /tmp/body_scan.txt || true
           echo
 
+          # Si no es 200, ahí sí fallamos (problema real: auth/red/etc.)
           if [[ "${code}" != "200" ]]; then
             echo "ERROR: /agent/scan returned HTTP ${code}"
             exit 1
           fi
 
-          # Parse JSON safely with python (no depende de jq)
-          python - <<'PY'
-          import json, sys
-          p = "/tmp/body_scan.txt"
-          try:
-            data = json.load(open(p, "r", encoding="utf-8"))
-          except Exception as e:
-            print(f"FAILED parsing scan JSON: {e}")
-            sys.exit(1)
+          # Parsear in_rth sin jq
+          IN_RTH="$(python -c 'import json; d=json.load(open("/tmp/body_scan.txt")); print("true" if d.get("in_rth") else "false")')"
+          echo "in_rth=${IN_RTH}" >> "$GITHUB_OUTPUT"
+          echo "Parsed in_rth=${IN_RTH}"
 
-          in_rth = bool(data.get("in_rth", False))
-          status = str(data.get("status", "")).lower()
-          reason = str(data.get("reason", ""))
-
-          # Export outputs for next steps
-          with open(sys.argv[1], "a", encoding="utf-8") as f:
-            f.write(f"in_rth={'true' if in_rth else 'false'}\n")
-            f.write(f"scan_status={status}\n")
-
-          print("Parsed:")
-          print("  in_rth:", in_rth)
-          print("  status:", status)
-          print("  reason:", reason)
-          PY "$GITHUB_OUTPUT"
-
-          # Si NO está en RTH -> termina OK (sin fallar)
-          if [[ "${{ steps.scan.outputs.in_rth }}" != "true" ]]; then
-            echo "Outside RTH (in_rth=false). Exiting SUCCESS (no monitor/tick)."
+          # FUERA de RTH = SUCCESS + se salta tick
+          if [[ "${IN_RTH}" != "true" ]]; then
+            echo "Outside RTH -> skipping /monitor/tick (success)."
             exit 0
           fi
 
@@ -136,10 +93,7 @@ jobs:
           set -euo pipefail
           BASE="${{ secrets.BDV_BASE_URL }}"
 
-          curl -sS --fail-with-body \
-            --retry 5 --retry-delay 2 --retry-all-errors \
-            --connect-timeout 5 --max-time 25 \
-            -D /tmp/headers_tick.txt \
+          curl -sS --retry 5 --retry-delay 2 --retry-all-errors --connect-timeout 5 --max-time 25 \
             -o /tmp/body_tick.txt \
             "${BASE}/monitor/tick" \
             -H "accept: application/json" \
@@ -147,9 +101,6 @@ jobs:
             -w "%{http_code}" > /tmp/code_tick.txt
 
           echo "HTTP $(cat /tmp/code_tick.txt || true)"
-          echo "---- headers (tick) ----"
-          head -c 2000 /tmp/headers_tick.txt || true
-          echo
           echo "---- body (tick) ----"
           head -c 2000 /tmp/body_tick.txt || true
           echo
