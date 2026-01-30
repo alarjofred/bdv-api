@@ -2,8 +2,7 @@ name: BDV Cron (scan + monitor)
 
 on:
   schedule:
-    # Ventana amplia UTC para cubrir 9:30–16:00 ET (DST incluido).
-    - cron: "*/5 13-21 * * 1-5"
+    - cron: "*/5 * * * 1-5"
   workflow_dispatch:
 
 jobs:
@@ -12,16 +11,39 @@ jobs:
     timeout-minutes: 5
 
     steps:
-      - name: BDV tick (robust, never-fail outside RTH)
+      - name: BDV run (RTH-aware, robust, no curl23)
         shell: bash
         run: |
-          set -u  # NO set -e (para no morir por transient y poder loguear)
+          set -u
 
           BASE="${{ secrets.BDV_BASE_URL }}"
           SECRET="${{ secrets.BDV_AGENT_SECRET }}"
 
           if [[ -z "${BASE}" || -z "${SECRET}" ]]; then
-            echo "ERROR: Missing BDV_BASE_URL or BDV_AGENT_SECRET secrets." >&2
+            echo "ERROR: Missing secrets BDV_BASE_URL or BDV_AGENT_SECRET"
+            exit 1
+          fi
+
+          # --- RTH check using America/New_York (handles DST automatically) ---
+          IN_RTH_WINDOW="$(python3 - <<'PY'
+from datetime import datetime, time
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    print("0"); raise
+ny = ZoneInfo("America/New_York")
+now = datetime.now(ny)
+# Lun-Vie
+if now.weekday() > 4:
+    print("0"); raise SystemExit
+# 09:30 to 16:00
+start = time(9,30)
+end   = time(16,0)
+print("1" if (start <= now.time() <= end) else "0")
+PY
+)"
+          if [[ "$IN_RTH_WINDOW" != "1" ]]; then
+            echo "Outside RTH window (NY 09:30-16:00). Exit GREEN."
             exit 0
           fi
 
@@ -31,10 +53,12 @@ jobs:
             local out="$3"
             local hdr="$4"
 
-            echo "==> $method $url" >&2
+            echo "==> $method $url"
 
-            local http_code="000"
-            http_code=$(curl -sS --retry 5 --retry-delay 2 --retry-all-errors --max-time 20 \
+            # capturamos HTTP sin spamear salida
+            local http="000"
+            http=$(curl -sS -L --connect-timeout 10 --max-time 20 \
+              --retry 5 --retry-delay 2 --retry-all-errors \
               -X "$method" \
               -D "$hdr" \
               -o "$out" \
@@ -43,54 +67,55 @@ jobs:
               -w "%{http_code}" \
               "$url" 2>/dev/null || echo "000")
 
-            echo "HTTP $http_code" >&2
-            echo "-- body (first 2000 chars) --" >&2
-            head -c 2000 "$out" >&2 || true
-            echo >&2
+            echo "HTTP $http"
+            echo "-- body (first 800 chars) --"
+            head -c 800 "$out" || true
+            echo
 
-            echo "$http_code"
+            echo "$http"
           }
 
           # 1) status
           code="$(call GET "$BASE/config/status" /tmp/status.json /tmp/status.hdr)"
           if [[ "$code" != "200" ]]; then
-            echo "WARN: /config/status failed (HTTP $code). Exiting green." >&2
-            exit 0
+            echo "FAIL (RTH): /config/status HTTP $code"
+            exit 1
           fi
 
-          # 2) set auto (querystring)
+          # 2) force auto
           code="$(call POST "$BASE/config/execution-mode?mode=auto" /tmp/set_auto.json /tmp/set_auto.hdr)"
           if [[ "$code" != "200" ]]; then
-            echo "WARN: /config/execution-mode failed (HTTP $code). Exiting green." >&2
-            exit 0
+            echo "FAIL (RTH): /config/execution-mode HTTP $code"
+            exit 1
           fi
 
           # 3) scan
           code="$(call GET "$BASE/agent/scan?force_analysis=0" /tmp/scan.json /tmp/scan.hdr)"
           if [[ "$code" != "200" ]]; then
-            echo "WARN: /agent/scan failed (HTTP $code). Exiting green." >&2
-            exit 0
+            echo "FAIL (RTH): /agent/scan HTTP $code"
+            exit 1
           fi
 
-          # Decide tick según scan (sin fallar fuera de RTH)
-          RUN_TICK="$(python3 - <<'PY'
+          # Si scan dice que no es operable, NO fallamos (porque puede ser stale)
+          OPERABLE="$(python3 - <<'PY'
 import json
-data=json.load(open("/tmp/scan.json","r",encoding="utf-8"))
-in_rth=bool(data.get("in_rth", False))
-status=str(data.get("status","")).lower()
-print("1" if (in_rth and status in ("ok","green")) else "0")
+d=json.load(open("/tmp/scan.json","r",encoding="utf-8"))
+status=str(d.get("status","")).lower()
+in_rth=bool(d.get("in_rth", False))
+# Solo ejecuta tick si scan está green/ok y in_rth true
+print("1" if (in_rth and status in ("green","ok")) else "0")
 PY
 )"
-          if [[ "$RUN_TICK" != "1" ]]; then
-            echo "Not operable now (outside RTH or non-green). Exiting green." >&2
+          if [[ "$OPERABLE" != "1" ]]; then
+            echo "Scan says NOT operable (even inside time window). Exit GREEN."
             exit 0
           fi
 
           # 4) tick
           code="$(call GET "$BASE/monitor/tick" /tmp/tick.json /tmp/tick.hdr)"
           if [[ "$code" != "200" ]]; then
-            echo "WARN: /monitor/tick failed (HTTP $code). Exiting green." >&2
-            exit 0
+            echo "FAIL (RTH): /monitor/tick HTTP $code"
+            exit 1
           fi
 
-          echo "Done." >&2
+          echo "DONE OK (RTH)."
