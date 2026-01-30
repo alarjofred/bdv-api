@@ -2,12 +2,8 @@ name: BDV Cron (scan + monitor)
 
 on:
   schedule:
-    # PRO: GitHub cron usa UTC. Ponemos dos ventanas (EST/EDT) y el backend decide con in_rth.
-    # EST (invierno): 9:30–16:00 ET ≈ 14:30–21:00 UTC -> usamos 14-20 (cada 5 min) y gatekeeper filtra.
-    - cron: "*/5 14-20 * * 1-5"
-    # EDT (verano): 9:30–16:00 ET ≈ 13:30–20:00 UTC -> usamos 13-19 y gatekeeper filtra.
-    - cron: "*/5 13-19 * * 1-5"
-  workflow_dispatch: {}
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
 
 jobs:
   bdv:
@@ -19,93 +15,71 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          BASE="${{ secrets.BDV_BASE_URL }}"
 
           echo "Checking config status..."
-          curl -sS --retry 5 --retry-delay 2 --retry-all-errors --connect-timeout 5 --max-time 25 \
+          curl -sS --retry 5 --retry-delay 2 --retry-all-errors --max-time 20 \
             -D /tmp/headers_status.txt \
             -o /tmp/body_status.txt \
-            "${BASE}/config/status" \
+            "${{ secrets.BDV_BASE_URL }}/config/status" \
             -H "accept: application/json" \
             -H "x-bdv-secret: ${{ secrets.BDV_AGENT_SECRET }}" \
-            -w "%{http_code}" > /tmp/code_status.txt
+            -w "\nHTTP %{http_code}\n"
 
-          echo "HTTP $(cat /tmp/code_status.txt || true)"
+          echo "---- headers (status) ----"
+          head -c 2000 /tmp/headers_status.txt || true
+          echo
           echo "---- body (status) ----"
           head -c 2000 /tmp/body_status.txt || true
           echo
 
           echo "Setting execution_mode=auto via querystring..."
-          curl -sS --retry 5 --retry-delay 2 --retry-all-errors --connect-timeout 5 --max-time 25 \
+          curl -sS --retry 5 --retry-delay 2 --retry-all-errors --max-time 20 \
             -D /tmp/headers_set.txt \
             -o /tmp/body_set.txt \
-            -X POST "${BASE}/config/execution-mode?mode=auto" \
+            -X POST "${{ secrets.BDV_BASE_URL }}/config/execution-mode?mode=auto" \
             -H "accept: application/json" \
             -H "x-bdv-secret: ${{ secrets.BDV_AGENT_SECRET }}" \
-            -w "%{http_code}" > /tmp/code_set.txt
+            -w "\nHTTP %{http_code}\n"
 
-          echo "HTTP $(cat /tmp/code_set.txt || true)"
+          echo "---- headers (set) ----"
+          head -c 2000 /tmp/headers_set.txt || true
+          echo
           echo "---- body (set) ----"
           head -c 2000 /tmp/body_set.txt || true
           echo
 
-      - name: Call /agent/scan (gatekeeper: DO NOT FAIL outside RTH)
-        id: scan
+          echo "Re-check config status..."
+          curl -sS --retry 5 --retry-delay 2 --retry-all-errors --max-time 20 \
+            -o /tmp/body_status2.txt \
+            "${{ secrets.BDV_BASE_URL }}/config/status" \
+            -H "accept: application/json" \
+            -H "x-bdv-secret: ${{ secrets.BDV_AGENT_SECRET }}" \
+            -w "\nHTTP %{http_code}\n"
+          head -c 2000 /tmp/body_status2.txt || true
+          echo
+
+      - name: Call /agent/scan
         shell: bash
         run: |
           set -euo pipefail
-          BASE="${{ secrets.BDV_BASE_URL }}"
-
-          curl -sS --retry 5 --retry-delay 2 --retry-all-errors --connect-timeout 5 --max-time 25 \
+          curl -sS --retry 5 --retry-delay 2 --retry-all-errors --max-time 20 \
             -o /tmp/body_scan.txt \
-            "${BASE}/agent/scan?force_analysis=0" \
+            "${{ secrets.BDV_BASE_URL }}/agent/scan?force_analysis=0" \
             -H "accept: application/json" \
             -H "x-bdv-secret: ${{ secrets.BDV_AGENT_SECRET }}" \
-            -w "%{http_code}" > /tmp/code_scan.txt
-
-          code="$(cat /tmp/code_scan.txt || true)"
-          echo "HTTP ${code}"
-          echo "---- body (scan) ----"
+            -w "\nHTTP %{http_code}\n"
           head -c 2000 /tmp/body_scan.txt || true
           echo
 
-          # Si no es 200, ahí sí fallamos (problema real: auth/red/etc.)
-          if [[ "${code}" != "200" ]]; then
-            echo "ERROR: /agent/scan returned HTTP ${code}"
-            exit 1
-          fi
-
-          # Parsear in_rth sin jq
-          IN_RTH="$(python -c 'import json; d=json.load(open("/tmp/body_scan.txt")); print("true" if d.get("in_rth") else "false")')"
-          echo "in_rth=${IN_RTH}" >> "$GITHUB_OUTPUT"
-          echo "Parsed in_rth=${IN_RTH}"
-
-          # FUERA de RTH = SUCCESS + se salta tick
-          if [[ "${IN_RTH}" != "true" ]]; then
-            echo "Outside RTH -> skipping /monitor/tick (success)."
-            exit 0
-          fi
-
-      - name: Call /monitor/tick (ONLY if in RTH)
-        if: steps.scan.outputs.in_rth == 'true'
+      - name: Call /monitor/tick
         shell: bash
         run: |
           set -euo pipefail
-          BASE="${{ secrets.BDV_BASE_URL }}"
-
-          curl -sS --retry 5 --retry-delay 2 --retry-all-errors --connect-timeout 5 --max-time 25 \
+          curl -sS --retry 5 --retry-delay 2 --retry-all-errors --max-time 20 \
             -o /tmp/body_tick.txt \
-            "${BASE}/monitor/tick" \
+            "${{ secrets.BDV_BASE_URL }}/monitor/tick" \
             -H "accept: application/json" \
             -H "x-bdv-secret: ${{ secrets.BDV_AGENT_SECRET }}" \
-            -w "%{http_code}" > /tmp/code_tick.txt
-
-          echo "HTTP $(cat /tmp/code_tick.txt || true)"
-          echo "---- body (tick) ----"
+            -w "\nHTTP %{http_code}\n"
           head -c 2000 /tmp/body_tick.txt || true
           echo
-
-          if [[ "$(cat /tmp/code_tick.txt || true)" != "200" ]]; then
-            echo "ERROR: /monitor/tick returned non-200"
-            exit 1
-          fi
