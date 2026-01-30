@@ -53,14 +53,16 @@ jobs:
               "$url"
           }
 
-          call() {
-            local path="$1"
+          call_method() {
+            local method="$1"
+            local path="$2"
             local url="${BASE_URL}${path}"
             local tmp_body
             tmp_body="$(mktemp)"
 
             http_code=$(
               curl -sS -o "$tmp_body" -w "%{http_code}" \
+                -X "$method" \
                 -H "Authorization: Bearer ${API_KEY}" \
                 -H "Content-Type: application/json" \
                 --connect-timeout 5 --max-time 20 \
@@ -70,44 +72,49 @@ jobs:
             snippet=$(head -c 300 "$tmp_body" | tr '\n' ' ' | sed 's/  */ /g')
             rm -f "$tmp_body"
 
-            echo "ENDPOINT ${path} -> http_code=${http_code} | body_snippet=${snippet}"
+            echo "ENDPOINT ${method} ${path} -> http_code=${http_code} | body_snippet=${snippet}"
 
             if [ "$http_code" != "200" ]; then
-              echo "FAIL: ${path} returned ${http_code}"
+              echo "FAIL: ${method} ${path} returned ${http_code}"
               exit 1
             fi
           }
 
+          call() {
+            local path="$1"
+            call_method "GET" "$path"
+          }
+
           # 1) Set execution mode AUTO (endpoint real)
-call_method "POST" "/config/execution-mode?mode=auto"
+          call_method "POST" "/config/execution-mode?mode=auto"
 
-# 2) Set risk mode LOW (endpoint real)
-call_method "POST" "/config/risk-mode?mode=low"
+          # 2) Set risk mode LOW (endpoint real)
+          call_method "POST" "/config/risk-mode?mode=low"
 
-# 3) Validate config is actually in auto
-cfg="$(get_json "/config/status")"
-mode="$(echo "$cfg" | jq -r '.execution_mode // empty')"
-risk="$(echo "$cfg" | jq -r '.risk_mode // empty')"
-echo "CHECK config/status -> execution_mode=${mode} risk_mode=${risk}"
+          # 3) Validate config is actually in auto
+          cfg="$(get_json "/config/status")"
+          mode="$(echo "$cfg" | jq -r '.execution_mode // empty')"
+          risk="$(echo "$cfg" | jq -r '.risk_mode // empty')"
+          echo "CHECK config/status -> execution_mode=${mode} risk_mode=${risk}"
 
-if [ "$mode" != "auto" ]; then
-  echo "FAIL: execution_mode is not auto after POST /config/execution-mode"
-  echo "CFG_SNIPPET: $(echo "$cfg" | head -c 400 | tr '\n' ' ')"
-  exit 1
-fi
+          if [ "$mode" != "auto" ]; then
+            echo "FAIL: execution_mode is not auto after POST /config/execution-mode"
+            echo "CFG_SNIPPET: $(echo "$cfg" | head -c 400 | tr '\n' ' ')"
+            exit 1
+          fi
 
-# 4) Run scan
-call "/agent/scan"
+          # 4) Run scan
+          call "/agent/scan"
 
-# 5) Tick with skip protection
-tick="$(get_json "/monitor/tick")"
-tstatus="$(echo "$tick" | jq -r '.status // empty')"
-treason="$(echo "$tick" | jq -r '.reason // empty')"
-echo "CHECK monitor/tick -> status=${tstatus} reason=${treason}"
+          # 5) Tick with skip protection (NO debe ser skipped dentro de RTH)
+          tick="$(get_json "/monitor/tick")"
+          tstatus="$(echo "$tick" | jq -r '.status // empty')"
+          treason="$(echo "$tick" | jq -r '.reason // empty')"
+          echo "CHECK monitor/tick -> status=${tstatus} reason=${treason}"
 
-if [ "$tstatus" = "skipped" ]; then
-  echo "FAIL: monitor/tick skipped inside RTH -> ${treason}"
-  exit 1
-fi
+          if [ "$tstatus" = "skipped" ]; then
+            echo "FAIL: monitor/tick skipped inside RTH -> ${treason}"
+            exit 1
+          fi
 
-echo "All checks OK inside RTH."
+          echo "All checks OK inside RTH."
