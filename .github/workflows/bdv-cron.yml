@@ -78,32 +78,36 @@ jobs:
             fi
           }
 
-          # 1) Intentar activar auto
-          call "/config/status?set=auto"
+          # 1) Set execution mode AUTO (endpoint real)
+call_method "POST" "/config/execution-mode?mode=auto"
 
-          # 2) Verificar que realmente quedó en auto (si no, FAIL)
-          cfg="$(get_json "/config/status")"
-          mode="$(echo "$cfg" | jq -r '.execution_mode // empty')"
-          echo "CHECK execution_mode after set=auto -> ${mode}"
+# 2) Set risk mode LOW (endpoint real)
+call_method "POST" "/config/risk-mode?mode=low"
 
-          if [ "$mode" != "auto" ]; then
-            echo "FAIL: execution_mode did not switch to auto."
-            echo "CFG_SNIPPET: $(echo "$cfg" | head -c 400 | tr '\n' ' ')"
-            exit 1
-          fi
+# 3) Validate config is actually in auto
+cfg="$(get_json "/config/status")"
+mode="$(echo "$cfg" | jq -r '.execution_mode // empty')"
+risk="$(echo "$cfg" | jq -r '.risk_mode // empty')"
+echo "CHECK config/status -> execution_mode=${mode} risk_mode=${risk}"
 
-          # 3) Continuar operación
-          call "/agent/scan"
+if [ "$mode" != "auto" ]; then
+  echo "FAIL: execution_mode is not auto after POST /config/execution-mode"
+  echo "CFG_SNIPPET: $(echo "$cfg" | head -c 400 | tr '\n' ' ')"
+  exit 1
+fi
 
-          # 4) Tick con verificación adicional (si responde skipped, FAIL)
-          tick="$(get_json "/monitor/tick")"
-          tstatus="$(echo "$tick" | jq -r '.status // empty')"
-          treason="$(echo "$tick" | jq -r '.reason // empty')"
-          echo "CHECK monitor/tick -> status=${tstatus} reason=${treason}"
+# 4) Run scan
+call "/agent/scan"
 
-          if [ "$tstatus" = "skipped" ]; then
-            echo "FAIL: monitor/tick skipped inside RTH -> ${treason}"
-            exit 1
-          fi
+# 5) Tick with skip protection
+tick="$(get_json "/monitor/tick")"
+tstatus="$(echo "$tick" | jq -r '.status // empty')"
+treason="$(echo "$tick" | jq -r '.reason // empty')"
+echo "CHECK monitor/tick -> status=${tstatus} reason=${treason}"
 
-          echo "All checks OK inside RTH."
+if [ "$tstatus" = "skipped" ]; then
+  echo "FAIL: monitor/tick skipped inside RTH -> ${treason}"
+  exit 1
+fi
+
+echo "All checks OK inside RTH."
