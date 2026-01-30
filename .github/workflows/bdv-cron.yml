@@ -11,33 +11,31 @@ jobs:
     timeout-minutes: 5
 
     steps:
-      - name: BDV run (RTH-aware, robust)
+      - name: Scan + Monitor (RTH-aware, no curl23)
         shell: bash
         run: |
-          set -u
+          set -euo pipefail
 
           BASE="${{ secrets.BDV_BASE_URL }}"
           SECRET="${{ secrets.BDV_AGENT_SECRET }}"
 
-          if [[ -z "${BASE}" || -z "${SECRET}" ]]; then
-            echo "ERROR: Missing secrets BDV_BASE_URL or BDV_AGENT_SECRET"
+          if [[ -z "$BASE" || -z "$SECRET" ]]; then
+            echo "ERROR: Missing BDV_BASE_URL or BDV_AGENT_SECRET"
             exit 1
           fi
 
-          IN_RTH_WINDOW="$(python3 - <<'PY'
-from datetime import datetime, time
-from zoneinfo import ZoneInfo
-ny = ZoneInfo("America/New_York")
-now = datetime.now(ny)
-if now.weekday() > 4:
-    print("0"); raise SystemExit
-start = time(9,30)
-end   = time(16,0)
-print("1" if (start <= now.time() <= end) else "0")
-PY
-)"
-          if [[ "$IN_RTH_WINDOW" != "1" ]]; then
-            echo "Outside RTH window (NY 09:30-16:00). Exit GREEN."
+          # ---- RTH gate (America/New_York 09:30-16:00) ----
+          export TZ="America/New_York"
+          DOW="$(date +%u)"      # 1..7
+          HHMM="$(date +%H%M)"   # 0000..2359
+
+          if (( DOW > 5 )); then
+            echo "Outside RTH: weekend -> exit OK"
+            exit 0
+          fi
+
+          if (( 10#$HHMM < 930 || 10#$HHMM > 1600 )); then
+            echo "Outside RTH: now=$HHMM NY -> exit OK"
             exit 0
           fi
 
@@ -47,45 +45,43 @@ PY
             local out="$3"
 
             echo "==> $method $url"
-            http=$(curl -sS -L --connect-timeout 10 --max-time 20 \
+            local code
+            code=$(curl -sS -L --connect-timeout 10 --max-time 20 \
               --retry 5 --retry-delay 2 --retry-all-errors \
               -X "$method" \
               -o "$out" \
               -H "accept: application/json" \
               -H "x-bdv-secret: $SECRET" \
               -w "%{http_code}" \
-              "$url" 2>/dev/null || echo "000")
+              "$url" || echo "000")
 
-            echo "HTTP $http"
-            echo "-- body (first 600 chars) --"
-            head -c 600 "$out" || true
+            echo "HTTP $code"
+            echo "-- body head --"
+            head -c 800 "$out" || true
             echo
-            echo "$http"
+            echo "$code"
           }
 
+          # 1) status
           code="$(call GET "$BASE/config/status" /tmp/status.json)"
-          [[ "$code" == "200" ]] || { echo "FAIL: /config/status"; exit 1; }
+          [[ "$code" == "200" ]] || { echo "FAIL /config/status"; exit 1; }
 
+          # 2) force auto via querystring (sin body)
           code="$(call POST "$BASE/config/execution-mode?mode=auto" /tmp/set_auto.json)"
-          [[ "$code" == "200" ]] || { echo "FAIL: /config/execution-mode"; exit 1; }
+          [[ "$code" == "200" ]] || { echo "FAIL /config/execution-mode"; exit 1; }
 
+          # 3) scan
           code="$(call GET "$BASE/agent/scan?force_analysis=0" /tmp/scan.json)"
-          [[ "$code" == "200" ]] || { echo "FAIL: /agent/scan"; exit 1; }
+          [[ "$code" == "200" ]] || { echo "FAIL /agent/scan"; exit 1; }
 
-          OPERABLE="$(python3 - <<'PY'
-import json
-d=json.load(open("/tmp/scan.json","r",encoding="utf-8"))
-status=str(d.get("status","")).lower()
-in_rth=bool(d.get("in_rth", False))
-print("1" if (in_rth and status in ("green","ok")) else "0")
-PY
-)"
-          if [[ "$OPERABLE" != "1" ]]; then
-            echo "Scan NOT operable -> Exit GREEN."
+          # 4) si scan dice no operable, NO fallar (exit OK)
+          if grep -qi '"status"[[:space:]]*:[[:space:]]*"yellow"' /tmp/scan.json; then
+            echo "Scan yellow -> exit OK"
             exit 0
           fi
 
+          # 5) tick
           code="$(call GET "$BASE/monitor/tick" /tmp/tick.json)"
-          [[ "$code" == "200" ]] || { echo "FAIL: /monitor/tick"; exit 1; }
+          [[ "$code" == "200" ]] || { echo "FAIL /monitor/tick"; exit 1; }
 
-          echo "DONE OK."
+          echo "DONE OK"
