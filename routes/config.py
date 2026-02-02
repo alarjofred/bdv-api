@@ -4,7 +4,8 @@ from typing import Any, Optional
 import json
 import os
 
-from fastapi import APIRouter, Body, Header, HTTPException, Query, Request
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
+from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel
 
 router = APIRouter(prefix="/config", tags=["config"])
@@ -49,37 +50,35 @@ def _norm(v: str) -> str:
 # =========================
 # Seguridad para POST /config/*
 # =========================
+api_key_header = APIKeyHeader(name="X-BDV-SECRET", auto_error=False)
+
+
 def _get_agent_secret() -> str:
-    # Leer SIEMPRE del env (env solo cambia con redeploy, pero así queda robusto)
+    # Leer siempre del env
     return os.getenv("BDV_AGENT_SECRET", "").strip()
 
 
-def _require_secret(x_bdv_secret: Optional[str], secret_q: Optional[str]) -> None:
+def _require_secret(x_bdv_secret: Optional[str]) -> None:
     """
-    Si BDV_AGENT_SECRET está definido, exige secreto en:
-      - Header: X-BDV-SECRET
-      o
-      - Query:  ?secret=...
+    Si BDV_AGENT_SECRET está definido, exige header X-BDV-SECRET en endpoints POST.
     """
     expected = _get_agent_secret()
-    if not expected:
-        return
-
-    got_header = (x_bdv_secret or "").strip()
-    got_query = (secret_q or "").strip()
-
-    if got_header == expected or got_query == expected:
-        return
-
-    raise HTTPException(status_code=401, detail="Unauthorized: missing/invalid X-BDV-SECRET")
+    if expected:
+        got = (x_bdv_secret or "").strip()
+        if not got or got != expected:
+            raise HTTPException(status_code=401, detail="Unauthorized: missing/invalid X-BDV-SECRET")
 
 
 # =========================
 # Persistencia en Disk (Render)
 # =========================
+def _get_persist_dir() -> str:
+    return (os.getenv("BDV_PERSIST_DIR", "/var/data") or "/var/data").strip() or "/var/data"
+
+
 def _get_config_path() -> Path:
-    persist_dir = (os.getenv("BDV_PERSIST_DIR", "/var/data") or "/var/data").strip()
-    config_file = (os.getenv("BDV_CONFIG_FILE", "bdv_config.json") or "bdv_config.json").strip()
+    persist_dir = _get_persist_dir()
+    config_file = (os.getenv("BDV_CONFIG_FILE", "bdv_config.json") or "bdv_config.json").strip() or "bdv_config.json"
     return Path(persist_dir) / config_file
 
 
@@ -92,8 +91,12 @@ def _safe_enum(enum_cls, value: Any, default):
 
 
 def _load_config_from_disk() -> None:
+    """
+    Carga config persistida al iniciar el proceso.
+    NO rompe el server si el archivo no existe o está corrupto.
+    """
+    path = _get_config_path()
     try:
-        path = _get_config_path()
         if path.exists():
             raw = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(raw, dict):
@@ -117,10 +120,13 @@ def _load_config_from_disk() -> None:
 
 
 def _save_config_to_disk() -> None:
+    """
+    Guarda config de forma atómica para evitar corrupciones:
+    escribe .tmp y luego os.replace()
+    """
+    path = _get_config_path()
     try:
-        path = _get_config_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-
         tmp = path.with_suffix(".tmp")
         payload = {
             "execution_mode": config_state.execution_mode.value,
@@ -133,7 +139,7 @@ def _save_config_to_disk() -> None:
         pass
 
 
-# Cargar estado al iniciar
+# Cargar estado al levantar el proceso (import time)
 _load_config_from_disk()
 
 
@@ -145,13 +151,13 @@ async def _extract_mode(
     alt_key: str,
     allowed: set[str],
 ) -> str:
-    # 1) Querystring
+    # 1) Querystring (lo más robusto para cron)
     if query_mode:
         m = _norm(str(query_mode))
         if m in allowed:
             return m
 
-    # 2) Body parseado (dict / str)
+    # 2) Body ya parseado (dict / str)
     if isinstance(body_obj, dict):
         v = body_obj.get(primary_key) or body_obj.get(alt_key)
         if v is not None:
@@ -164,16 +170,18 @@ async def _extract_mode(
         if m in allowed:
             return m
 
-    # 3) Raw body fallback
+    # 3) Raw body fallback (si vino vacío / raro / no-JSON)
     raw = await request.body()
     if raw:
         text = raw.decode("utf-8", errors="ignore").strip()
 
+        # raw: auto
         if text and not text.startswith("{") and not text.startswith("["):
             m = _norm(text.strip('"').strip("'"))
             if m in allowed:
                 return m
 
+        # JSON dict o JSON string
         try:
             parsed = json.loads(text)
             if isinstance(parsed, dict):
@@ -191,7 +199,10 @@ async def _extract_mode(
 
     raise HTTPException(
         status_code=422,
-        detail=f"mode is required and must be one of: {sorted(list(allowed))}. Use ?mode=... or JSON body.",
+        detail=(
+            f"mode is required and must be one of: {sorted(list(allowed))}. "
+            f"Use ?mode=... or JSON body."
+        ),
     )
 
 
@@ -205,11 +216,10 @@ def get_config_status() -> ConfigStatus:
 async def set_execution_mode(
     request: Request,
     mode: Optional[str] = Query(default=None),
-    secret: Optional[str] = Query(default=None),  # <- PARA GPT: ?secret=...
     payload: Any = Body(default=None),
-    x_bdv_secret: Optional[str] = Header(default=None, alias="X-BDV-SECRET"),
+    x_bdv_secret: Optional[str] = Depends(api_key_header),
 ) -> ConfigStatus:
-    _require_secret(x_bdv_secret, secret)
+    _require_secret(x_bdv_secret)
 
     m = await _extract_mode(
         request=request,
@@ -229,11 +239,10 @@ async def set_execution_mode(
 async def set_risk_mode(
     request: Request,
     mode: Optional[str] = Query(default=None),
-    secret: Optional[str] = Query(default=None),  # <- PARA GPT: ?secret=...
     payload: Any = Body(default=None),
-    x_bdv_secret: Optional[str] = Header(default=None, alias="X-BDV-SECRET"),
+    x_bdv_secret: Optional[str] = Depends(api_key_header),
 ) -> ConfigStatus:
-    _require_secret(x_bdv_secret, secret)
+    _require_secret(x_bdv_secret)
 
     m = await _extract_mode(
         request=request,
@@ -251,10 +260,9 @@ async def set_risk_mode(
 
 @router.post("/reset-trades", response_model=ConfigStatus)
 def reset_trades_today(
-    secret: Optional[str] = Query(default=None),  # <- PARA GPT
-    x_bdv_secret: Optional[str] = Header(default=None, alias="X-BDV-SECRET"),
+    x_bdv_secret: Optional[str] = Depends(api_key_header),
 ) -> ConfigStatus:
-    _require_secret(x_bdv_secret, secret)
+    _require_secret(x_bdv_secret)
 
     config_state.trades_today = 0
     _sync_max_trades()
