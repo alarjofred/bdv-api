@@ -1,8 +1,8 @@
 from enum import Enum
+from pathlib import Path
 from typing import Any, Optional
 import json
 import os
-from pathlib import Path
 
 from fastapi import APIRouter, Body, Header, HTTPException, Query, Request
 from pydantic import BaseModel
@@ -49,24 +49,39 @@ def _norm(v: str) -> str:
 # =========================
 # Seguridad para POST /config/*
 # =========================
-BDV_AGENT_SECRET = os.getenv("BDV_AGENT_SECRET", "").strip()
+def _get_agent_secret() -> str:
+    # Leer siempre del env (por si cambias env y redeploy)
+    return os.getenv("BDV_AGENT_SECRET", "").strip()
 
 
 def _require_secret(x_bdv_secret: Optional[str]) -> None:
     """
     Si BDV_AGENT_SECRET está definido, exige header X-BDV-SECRET en endpoints POST.
     """
-    if BDV_AGENT_SECRET:
-        if not x_bdv_secret or x_bdv_secret.strip() != BDV_AGENT_SECRET:
+    expected = _get_agent_secret()
+    if expected:
+        got = (x_bdv_secret or "").strip()
+        if not got or got != expected:
             raise HTTPException(status_code=401, detail="Unauthorized: missing/invalid X-BDV-SECRET")
 
 
 # =========================
 # Persistencia en Disk (Render)
 # =========================
-PERSIST_DIR = os.getenv("BDV_PERSIST_DIR", "/var/data").strip() or "/var/data"
-CONFIG_FILE = os.getenv("BDV_CONFIG_FILE", "bdv_config.json").strip() or "bdv_config.json"
+PERSIST_DIR = (os.getenv("BDV_PERSIST_DIR", "/var/data") or "/var/data").strip()
+CONFIG_FILE = (os.getenv("BDV_CONFIG_FILE", "bdv_config.json") or "bdv_config.json").strip()
 CONFIG_PATH = Path(PERSIST_DIR) / CONFIG_FILE
+
+
+def _safe_enum(enum_cls, value: Any, default):
+    """
+    Convierte a Enum de forma segura sin tumbar el server.
+    """
+    try:
+        s = str(value).strip().lower()
+        return enum_cls(s)
+    except Exception:
+        return default
 
 
 def _load_config_from_disk() -> None:
@@ -79,11 +94,18 @@ def _load_config_from_disk() -> None:
             raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
             if isinstance(raw, dict):
                 if "execution_mode" in raw:
-                    config_state.execution_mode = ExecutionMode(str(raw["execution_mode"]).lower())
+                    config_state.execution_mode = _safe_enum(
+                        ExecutionMode, raw["execution_mode"], config_state.execution_mode
+                    )
                 if "risk_mode" in raw:
-                    config_state.risk_mode = RiskMode(str(raw["risk_mode"]).lower())
+                    config_state.risk_mode = _safe_enum(
+                        RiskMode, raw["risk_mode"], config_state.risk_mode
+                    )
                 if "trades_today" in raw:
-                    config_state.trades_today = int(raw["trades_today"])
+                    try:
+                        config_state.trades_today = int(raw["trades_today"])
+                    except Exception:
+                        pass
     except Exception:
         pass
     finally:
@@ -101,7 +123,7 @@ def _save_config_to_disk() -> None:
         payload = {
             "execution_mode": config_state.execution_mode.value,
             "risk_mode": config_state.risk_mode.value,
-            "trades_today": config_state.trades_today,
+            "trades_today": int(config_state.trades_today),
         }
         tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         os.replace(tmp, CONFIG_PATH)  # atomic
@@ -187,7 +209,7 @@ async def set_execution_mode(
     request: Request,
     mode: Optional[str] = Query(default=None),
     payload: Any = Body(default=None),
-    x_bdv_secret: Optional[str] = Header(default=None),
+    x_bdv_secret: Optional[str] = Header(default=None, alias="X-BDV-SECRET"),
 ) -> ConfigStatus:
     _require_secret(x_bdv_secret)
 
@@ -210,7 +232,7 @@ async def set_risk_mode(
     request: Request,
     mode: Optional[str] = Query(default=None),
     payload: Any = Body(default=None),
-    x_bdv_secret: Optional[str] = Header(default=None),
+    x_bdv_secret: Optional[str] = Header(default=None, alias="X-BDV-SECRET"),
 ) -> ConfigStatus:
     _require_secret(x_bdv_secret)
 
@@ -230,7 +252,7 @@ async def set_risk_mode(
 
 @router.post("/reset-trades", response_model=ConfigStatus)
 def reset_trades_today(
-    x_bdv_secret: Optional[str] = Header(default=None),
+    x_bdv_secret: Optional[str] = Header(default=None, alias="X-BDV-SECRET"),
 ) -> ConfigStatus:
     _require_secret(x_bdv_secret)
 
