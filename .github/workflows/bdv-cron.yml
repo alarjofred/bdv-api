@@ -13,12 +13,19 @@ jobs:
       - name: BDV guard + calls
         env:
           BASE_URL: ${{ secrets.BDV_BASE_URL }}
-          API_KEY: ${{ secrets.BDV_API_KEY }}
+          BDV_AGENT_SECRET: ${{ secrets.BDV_AGENT_SECRET }}
         run: |
           set -euo pipefail
-
           sudo apt-get update -y
           sudo apt-get install -y jq
+
+          # DEBUG SEGURO: NO imprime el secret, solo confirma que existe
+          echo "BASE_URL=$BASE_URL"
+          echo "BDV_AGENT_SECRET_LEN=${#BDV_AGENT_SECRET}"
+          if [ -z "${BDV_AGENT_SECRET:-}" ]; then
+            echo "FAIL: BDV_AGENT_SECRET is EMPTY in GitHub Actions env"
+            exit 1
+          fi
 
           TZ="America/New_York"
           dow=$(TZ=$TZ date +%u)         # 1..7 (Mon..Sun)
@@ -26,7 +33,7 @@ jobs:
           now_iso=$(TZ=$TZ date +"%Y-%m-%d %H:%M:%S %Z")
           echo "NY_TIME=$now_iso (dow=$dow hhmm=$hhmm)"
 
-          # Weekend guard (extra seguridad aunque el cron sea 1-5)
+          # Weekend guard
           if [ "$dow" -ge 6 ]; then
             echo "Outside RTH (weekend) -> exit OK"
             exit 0
@@ -35,7 +42,6 @@ jobs:
           # RTH window (09:30–16:00)
           RTH_START=0930
           RTH_END=1600
-
           if [ "$hhmm" -lt "$RTH_START" ] || [ "$hhmm" -ge "$RTH_END" ]; then
             echo "Outside RTH: now=$hhmm NY -> exit OK"
             exit 0
@@ -47,9 +53,9 @@ jobs:
             local path="$1"
             local url="${BASE_URL}${path}"
             curl -sS \
-              -H "Authorization: Bearer ${API_KEY}" \
+              -H "X-BDV-SECRET: ${BDV_AGENT_SECRET}" \
               -H "Content-Type: application/json" \
-              --connect-timeout 5 --max-time 20 \
+              --connect-timeout 10 --max-time 30 \
               "$url"
           }
 
@@ -63,9 +69,9 @@ jobs:
             http_code=$(
               curl -sS -o "$tmp_body" -w "%{http_code}" \
                 -X "$method" \
-                -H "Authorization: Bearer ${API_KEY}" \
+                -H "X-BDV-SECRET: ${BDV_AGENT_SECRET}" \
                 -H "Content-Type: application/json" \
-                --connect-timeout 5 --max-time 20 \
+                --connect-timeout 10 --max-time 30 \
                 "$url" || echo "000"
             )
 
@@ -85,13 +91,13 @@ jobs:
             call_method "GET" "$path"
           }
 
-          # 1) Set execution mode AUTO (endpoint real)
+          # 1) Set execution mode AUTO
           call_method "POST" "/config/execution-mode?mode=auto"
 
-          # 2) Set risk mode LOW (endpoint real)
-          call_method "POST" "/config/risk-mode?mode=low"
+          # 2) Set risk mode MEDIUM (lo que tú quieres)
+          call_method "POST" "/config/risk-mode?mode=medium"
 
-          # 3) Validate config is actually in auto
+          # 3) Validate config is actually in auto/medium
           cfg="$(get_json "/config/status")"
           mode="$(echo "$cfg" | jq -r '.execution_mode // empty')"
           risk="$(echo "$cfg" | jq -r '.risk_mode // empty')"
@@ -103,10 +109,16 @@ jobs:
             exit 1
           fi
 
+          if [ "$risk" != "medium" ]; then
+            echo "FAIL: risk_mode is not medium after POST /config/risk-mode"
+            echo "CFG_SNIPPET: $(echo "$cfg" | head -c 400 | tr '\n' ' ')"
+            exit 1
+          fi
+
           # 4) Run scan
           call "/agent/scan"
 
-          # 5) Tick with skip protection (NO debe ser skipped dentro de RTH)
+          # 5) Tick (debe correr dentro de RTH)
           tick="$(get_json "/monitor/tick")"
           tstatus="$(echo "$tick" | jq -r '.status // empty')"
           treason="$(echo "$tick" | jq -r '.reason // empty')"
