@@ -1,10 +1,10 @@
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Set
 import json
 import os
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Body, HTTPException, Query, Request, Security
 from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel
 
@@ -48,23 +48,23 @@ def _norm(v: str) -> str:
 
 
 # =========================
-# Seguridad para POST /config/*
+# Seguridad: X-BDV-SECRET (Swagger "Authorize")
 # =========================
 api_key_header = APIKeyHeader(name="X-BDV-SECRET", auto_error=False)
 
 
 def _get_agent_secret() -> str:
-    # Leer siempre del env
+    # leer siempre del env
     return os.getenv("BDV_AGENT_SECRET", "").strip()
 
 
-def _require_secret(x_bdv_secret: Optional[str]) -> None:
+def _require_secret(api_key: Optional[str]) -> None:
     """
     Si BDV_AGENT_SECRET está definido, exige header X-BDV-SECRET en endpoints POST.
     """
     expected = _get_agent_secret()
     if expected:
-        got = (x_bdv_secret or "").strip()
+        got = (api_key or "").strip()
         if not got or got != expected:
             raise HTTPException(status_code=401, detail="Unauthorized: missing/invalid X-BDV-SECRET")
 
@@ -72,14 +72,9 @@ def _require_secret(x_bdv_secret: Optional[str]) -> None:
 # =========================
 # Persistencia en Disk (Render)
 # =========================
-def _get_persist_dir() -> str:
-    return (os.getenv("BDV_PERSIST_DIR", "/var/data") or "/var/data").strip() or "/var/data"
-
-
-def _get_config_path() -> Path:
-    persist_dir = _get_persist_dir()
-    config_file = (os.getenv("BDV_CONFIG_FILE", "bdv_config.json") or "bdv_config.json").strip() or "bdv_config.json"
-    return Path(persist_dir) / config_file
+PERSIST_DIR = (os.getenv("BDV_PERSIST_DIR", "/var/data") or "/var/data").strip()
+CONFIG_FILE = (os.getenv("BDV_CONFIG_FILE", "bdv_config.json") or "bdv_config.json").strip()
+CONFIG_PATH = Path(PERSIST_DIR) / CONFIG_FILE
 
 
 def _safe_enum(enum_cls, value: Any, default):
@@ -91,14 +86,9 @@ def _safe_enum(enum_cls, value: Any, default):
 
 
 def _load_config_from_disk() -> None:
-    """
-    Carga config persistida al iniciar el proceso.
-    NO rompe el server si el archivo no existe o está corrupto.
-    """
-    path = _get_config_path()
     try:
-        if path.exists():
-            raw = json.loads(path.read_text(encoding="utf-8"))
+        if CONFIG_PATH.exists():
+            raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
             if isinstance(raw, dict):
                 if "execution_mode" in raw:
                     config_state.execution_mode = _safe_enum(
@@ -120,26 +110,20 @@ def _load_config_from_disk() -> None:
 
 
 def _save_config_to_disk() -> None:
-    """
-    Guarda config de forma atómica para evitar corrupciones:
-    escribe .tmp y luego os.replace()
-    """
-    path = _get_config_path()
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = CONFIG_PATH.with_suffix(".tmp")
         payload = {
             "execution_mode": config_state.execution_mode.value,
             "risk_mode": config_state.risk_mode.value,
             "trades_today": int(config_state.trades_today),
         }
         tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        os.replace(tmp, path)  # atomic
+        os.replace(tmp, CONFIG_PATH)
     except Exception:
         pass
 
 
-# Cargar estado al levantar el proceso (import time)
 _load_config_from_disk()
 
 
@@ -149,9 +133,9 @@ async def _extract_mode(
     body_obj: Any,
     primary_key: str,
     alt_key: str,
-    allowed: set[str],
+    allowed: Set[str],
 ) -> str:
-    # 1) Querystring (lo más robusto para cron)
+    # 1) Querystring
     if query_mode:
         m = _norm(str(query_mode))
         if m in allowed:
@@ -170,7 +154,7 @@ async def _extract_mode(
         if m in allowed:
             return m
 
-    # 3) Raw body fallback (si vino vacío / raro / no-JSON)
+    # 3) Raw body fallback
     raw = await request.body()
     if raw:
         text = raw.decode("utf-8", errors="ignore").strip()
@@ -217,9 +201,9 @@ async def set_execution_mode(
     request: Request,
     mode: Optional[str] = Query(default=None),
     payload: Any = Body(default=None),
-    x_bdv_secret: Optional[str] = Depends(api_key_header),
+    api_key: Optional[str] = Security(api_key_header),
 ) -> ConfigStatus:
-    _require_secret(x_bdv_secret)
+    _require_secret(api_key)
 
     m = await _extract_mode(
         request=request,
@@ -240,9 +224,9 @@ async def set_risk_mode(
     request: Request,
     mode: Optional[str] = Query(default=None),
     payload: Any = Body(default=None),
-    x_bdv_secret: Optional[str] = Depends(api_key_header),
+    api_key: Optional[str] = Security(api_key_header),
 ) -> ConfigStatus:
-    _require_secret(x_bdv_secret)
+    _require_secret(api_key)
 
     m = await _extract_mode(
         request=request,
@@ -260,9 +244,9 @@ async def set_risk_mode(
 
 @router.post("/reset-trades", response_model=ConfigStatus)
 def reset_trades_today(
-    x_bdv_secret: Optional[str] = Depends(api_key_header),
+    api_key: Optional[str] = Security(api_key_header),
 ) -> ConfigStatus:
-    _require_secret(x_bdv_secret)
+    _require_secret(api_key)
 
     config_state.trades_today = 0
     _sync_max_trades()
