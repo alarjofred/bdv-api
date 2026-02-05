@@ -108,4 +108,47 @@ jobs:
           call_method "POST" "/config/execution-mode?mode=auto"
 
           # 2) Set risk mode MEDIUM
-          call_method "POST_
+          call_method "POST" "/config/risk-mode?mode=medium"
+
+          # 3) Validate config is actually in auto/medium
+          cfg="$(get_json "/config/status")"
+          mode="$(echo "$cfg" | jq -r '.execution_mode // empty')"
+          risk="$(echo "$cfg" | jq -r '.risk_mode // empty')"
+          echo "CHECK config/status -> execution_mode=${mode} risk_mode=${risk}"
+
+          if [ "$mode" != "auto" ]; then
+            echo "FAIL: execution_mode is not auto after POST /config/execution-mode"
+            echo "CFG_SNIPPET: $(echo "$cfg" | head -c 600 | tr '\n' ' ')"
+            exit 1
+          fi
+
+          if [ "$risk" != "medium" ]; then
+            echo "FAIL: risk_mode is not medium after POST /config/risk-mode"
+            echo "CFG_SNIPPET: $(echo "$cfg" | head -c 600 | tr '\n' ' ')"
+            exit 1
+          fi
+
+          # 4) Snapshot + pending (observabilidad)
+          snap="$(get_json "/snapshot")"
+          echo "SNAPSHOT_SNIPPET: $(echo "$snap" | head -c 600 | tr '\n' ' ')"
+
+          pend="$(get_json "/pending-trades/")"
+          pcount="$(echo "$pend" | jq 'length' 2>/dev/null || echo "NA")"
+          echo "PENDING_COUNT=${pcount} | PENDING_SNIPPET: $(echo "$pend" | head -c 600 | tr '\n' ' ')"
+
+          # 5) Run scan
+          call "/agent/scan"
+
+          # 6) Tick (debe correr dentro de RTH)
+          tick="$(get_json "/monitor/tick")"
+          tstatus="$(echo "$tick" | jq -r '.status // empty')"
+          treason="$(echo "$tick" | jq -r '.reason // empty')"
+          executed="$(echo "$tick" | jq -c '.pending_trades_executed // []' 2>/dev/null || echo "[]")"
+          echo "CHECK monitor/tick -> status=${tstatus} reason=${treason} pending_trades_executed=${executed}"
+
+          if [ "$tstatus" = "skipped" ]; then
+            echo "FAIL: monitor/tick skipped inside RTH -> ${treason}"
+            exit 1
+          fi
+
+          echo "All checks OK inside RTH."
