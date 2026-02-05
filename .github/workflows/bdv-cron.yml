@@ -9,6 +9,7 @@ jobs:
   bdv:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+
     steps:
       - name: BDV guard + calls
         env:
@@ -18,6 +19,9 @@ jobs:
           set -euo pipefail
           sudo apt-get update -y
           sudo apt-get install -y jq
+
+          # Normaliza BASE_URL (quita slash final si existe)
+          BASE_URL="${BASE_URL%/}"
 
           echo "BASE_URL=$BASE_URL"
           echo "BDV_AGENT_SECRET_LEN=${#BDV_AGENT_SECRET}"
@@ -63,6 +67,9 @@ jobs:
             local path="$2"
             local url="${BASE_URL}${path}"
             local tmp_body
+            local http_code
+            local snippet
+
             tmp_body="$(mktemp)"
 
             http_code=$(
@@ -74,7 +81,7 @@ jobs:
                 "$url" || echo "000"
             )
 
-            snippet=$(head -c 400 "$tmp_body" | tr '\n' ' ' | sed 's/  */ /g')
+            snippet=$(head -c 300 "$tmp_body" | tr '\n' ' ' | sed 's/  */ /g')
             rm -f "$tmp_body"
 
             echo "ENDPOINT ${method} ${path} -> http_code=${http_code} | body_snippet=${snippet}"
@@ -99,35 +106,24 @@ jobs:
 
           if [ "$mode" != "auto" ]; then
             echo "FAIL: execution_mode is not auto"
-            echo "CFG: $(echo "$cfg" | head -c 600 | tr '\n' ' ')"
+            echo "CFG_SNIPPET: $(echo "$cfg" | head -c 400 | tr '\n' ' ')"
             exit 1
           fi
 
           if [ "$risk" != "medium" ]; then
             echo "FAIL: risk_mode is not medium"
-            echo "CFG: $(echo "$cfg" | head -c 600 | tr '\n' ' ')"
+            echo "CFG_SNIPPET: $(echo "$cfg" | head -c 400 | tr '\n' ' ')"
             exit 1
           fi
 
-          # 4) Snapshot (para ver precios)
-          snap="$(get_json "/snapshot")"
-          echo "SNAPSHOT_SNIPPET: $(echo "$snap" | head -c 500 | tr '\n' ' ')"
-
-          # 5) Pending-trades (OJO: esta ruta puede no requerir secret, pero igual lo mandamos)
-          pend="$(get_json "/pending-trades/")"
-          pend_count="$(echo "$pend" | jq 'length' 2>/dev/null || echo 0)"
-          echo "PENDING_COUNT=${pend_count}"
-          echo "PENDING_SNIPPET: $(echo "$pend" | head -c 500 | tr '\n' ' ')"
-
-          # 6) Scan
+          # 4) Run scan
           call_method "GET" "/agent/scan"
 
-          # 7) Tick (debe intentar ejecutar pending trades si aplica)
+          # 5) Tick
           tick="$(get_json "/monitor/tick")"
           tstatus="$(echo "$tick" | jq -r '.status // empty')"
           treason="$(echo "$tick" | jq -r '.reason // empty')"
-          texec="$(echo "$tick" | jq -c '.pending_trades_executed // []')"
-          echo "CHECK monitor/tick -> status=${tstatus} reason=${treason} pending_trades_executed=${texec}"
+          echo "CHECK monitor/tick -> status=${tstatus} reason=${treason}"
 
           if [ "$tstatus" = "skipped" ]; then
             echo "FAIL: monitor/tick skipped inside RTH -> ${treason}"
