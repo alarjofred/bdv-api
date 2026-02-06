@@ -17,9 +17,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          sudo apt-get update -y
-          sudo apt-get install -y jq
-
+          # -------------------------
+          # Validación de env
+          # -------------------------
           if [ -z "${BASE_URL:-}" ]; then
             echo "FAIL: BASE_URL is EMPTY"
             exit 1
@@ -30,10 +30,23 @@ jobs:
             exit 1
           fi
 
+          # Normaliza BASE_URL: fuerza https y sin trailing slash
+          # (Esto evita redirects raros y respuestas NO-JSON)
+          if echo "$BASE_URL" | grep -qE '^http://'; then
+            BASE_URL="$(echo "$BASE_URL" | sed -E 's#^http://#https://#')"
+          elif ! echo "$BASE_URL" | grep -qE '^https://'; then
+            BASE_URL="https://${BASE_URL}"
+          fi
+          BASE_URL="$(echo "$BASE_URL" | sed -E 's#/*$##')"
+
           # Debug seguro (sin filtrar secretos)
+          echo "BASE_URL=${BASE_URL}"
           echo "BASE_URL_HOST=$(echo "$BASE_URL" | sed -E 's#https?://##' | cut -d/ -f1)"
           echo "BDV_AGENT_SECRET_LEN=${#BDV_AGENT_SECRET}"
 
+          # -------------------------
+          # Guard de horario NY
+          # -------------------------
           TZ="America/New_York"
           dow=$(TZ=$TZ date +%u)         # 1..7 (Mon..Sun)
           hhmm=$(TZ=$TZ date +%H%M)      # 0000..2359
@@ -56,47 +69,98 @@ jobs:
 
           echo "Inside RTH: now=$hhmm NY -> running endpoints"
 
-          curl_json() {
+          # -------------------------
+          # Caller robusto (sin jq)
+          # - imprime HTTP
+          # - imprime body (recortado)
+          # - falla si HTTP != 200
+          # -------------------------
+          call() {
             local method="$1"
             local path="$2"
             local url="${BASE_URL}${path}"
-            local tmp_body
-            tmp_body="$(mktemp)"
 
-            http_code=$(
-              curl -sS -o "$tmp_body" -w "%{http_code}" \
-                -X "$method" \
-                -H "X-BDV-SECRET: ${BDV_AGENT_SECRET}" \
-                -H "accept: application/json" \
-                -H "Content-Type: application/json" \
-                --retry 2 --retry-delay 1 --retry-connrefused \
-                --connect-timeout 10 --max-time 30 \
-                "$url" || echo "000"
-            )
+            local resp http body
+            resp="$(curl -sS -X "$method" "$url" \
+              -H "X-BDV-SECRET: ${BDV_AGENT_SECRET}" \
+              -H "accept: application/json" \
+              -H "Content-Type: application/json" \
+              --retry 2 --retry-delay 1 --retry-connrefused \
+              --connect-timeout 10 --max-time 30 \
+              -w "\n%{http_code}\n" )"
 
-            snippet=$(head -c 300 "$tmp_body" | tr '\n' ' ' | sed 's/  */ /g')
-            echo "ENDPOINT ${method} ${path} -> http_code=${http_code} | body_snippet=${snippet}"
+            http="$(echo "$resp" | tail -n1 | tr -d '\r')"
+            body="$(echo "$resp" | sed '$d')"
 
-            if [ "$http_code" != "200" ]; then
-              echo "FAIL: ${method} ${path} returned ${http_code}"
-              rm -f "$tmp_body"
+            # Log claro y consistente
+            echo "---- ${method} ${path}"
+            echo "HTTP=${http}"
+            echo "BODY_SNIP=$(echo "$body" | head -c 400 | tr '\n' ' ' | sed 's/  */ /g')"
+
+            if [ "$http" != "200" ]; then
+              echo "FAIL: ${method} ${path} returned HTTP ${http}"
+              echo "RAW_BODY_START"
+              echo "$body" | head -c 1200
+              echo ""
+              echo "RAW_BODY_END"
               exit 1
             fi
 
-            cat "$tmp_body"
-            rm -f "$tmp_body"
+            # Devuelve body completo por stdout
+            echo "$body"
           }
 
+          # Helper: extraer un campo JSON con Python (si no es JSON, falla con mensaje)
+          json_get() {
+            local json="$1"
+            local key="$2"
+            python3 - <<PY
+import json, sys
+raw = sys.stdin.read()
+try:
+    obj = json.loads(raw)
+except Exception as e:
+    print(f"FAIL: Response is not valid JSON when reading key '{key}'. Error: {e}")
+    print("RAW_BODY_START")
+    print(raw[:1200])
+    print("RAW_BODY_END")
+    sys.exit(2)
+
+val = obj
+for part in "$key".split("."):
+    if isinstance(val, dict) and part in val:
+        val = val[part]
+    else:
+        val = ""
+        break
+
+# imprime valor (string) sin comillas
+if val is None:
+    print("")
+elif isinstance(val, (dict, list)):
+    print(json.dumps(val))
+else:
+    print(str(val))
+PY
+          }
+
+          # -------------------------
           # 1) Set AUTO
-          curl_json "POST" "/config/execution-mode?mode=auto" >/dev/null
+          # -------------------------
+          call "POST" "/config/execution-mode?mode=auto" >/dev/null
 
+          # -------------------------
           # 2) Set MEDIUM
-          curl_json "POST" "/config/risk-mode?mode=medium" >/dev/null
+          # -------------------------
+          call "POST" "/config/risk-mode?mode=medium" >/dev/null
 
-          # 3) Verify status
-          cfg="$(curl_json "GET" "/config/status")"
-          mode="$(echo "$cfg" | jq -r '.execution_mode // empty')"
-          risk="$(echo "$cfg" | jq -r '.risk_mode // empty')"
+          # -------------------------
+          # 3) Verify status (auto/medium)
+          # -------------------------
+          cfg="$(call "GET" "/config/status")"
+          mode="$(printf "%s" "$cfg" | json_get /dev/stdin execution_mode || true)"
+          risk="$(printf "%s" "$cfg" | json_get /dev/stdin risk_mode || true)"
+
           echo "CHECK config/status -> execution_mode=${mode} risk_mode=${risk}"
 
           if [ "$mode" != "auto" ]; then
@@ -109,13 +173,24 @@ jobs:
             exit 1
           fi
 
-          # 4) Scan
-          curl_json "GET" "/agent/scan" >/dev/null
+          # -------------------------
+          # 4) Scan (opcional, pero útil)
+          # -------------------------
+          call "GET" "/agent/scan" >/dev/null
 
-          # 5) Tick
-          tick="$(curl_json "GET" "/monitor/tick")"
-          tstatus="$(echo "$tick" | jq -r '.status // empty')"
-          treason="$(echo "$tick" | jq -r '.reason // empty')"
+          # -------------------------
+          # 5) Tick (debe NO estar skipped dentro de RTH)
+          # -------------------------
+          tick="$(call "GET" "/monitor/tick")"
+          tstatus="$(printf "%s" "$tick" | python3 -c "import json,sys; 
+raw=sys.stdin.read(); 
+obj=json.loads(raw); 
+print(obj.get('status',''))" 2>/dev/null || true)"
+          treason="$(printf "%s" "$tick" | python3 -c "import json,sys; 
+raw=sys.stdin.read(); 
+obj=json.loads(raw); 
+print(obj.get('reason',''))" 2>/dev/null || true)"
+
           echo "CHECK monitor/tick -> status=${tstatus} reason=${treason}"
 
           if [ "$tstatus" = "skipped" ]; then
