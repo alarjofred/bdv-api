@@ -19,32 +19,16 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y jq
 
-          echo "BASE_URL=$BASE_URL"
+          # Normaliza BASE_URL (quita trailing slash si existe)
+          BASE_URL="${BASE_URL%/}"
+
+          # DEBUG SEGURO: NO imprime el secret, solo confirma que existe
+          echo "BASE_URL=${BASE_URL}"
           echo "BDV_AGENT_SECRET_LEN=${#BDV_AGENT_SECRET}"
           if [ -z "${BDV_AGENT_SECRET:-}" ]; then
             echo "FAIL: BDV_AGENT_SECRET is EMPTY in GitHub Actions env"
             exit 1
           fi
-
-          TZ="America/New_York"
-          dow=$(TZ=$TZ date +%u)
-          hhmm=$(TZ=$TZ date +%H%M)
-          now_iso=$(TZ=$TZ date +"%Y-%m-%d %H:%M:%S %Z")
-          echo "NY_TIME=$now_iso (dow=$dow hhmm=$hhmm)"
-
-          if [ "$dow" -ge 6 ]; then
-            echo "Outside RTH (weekend) -> exit OK"
-            exit 0
-          fi
-
-          RTH_START=0930
-          RTH_END=1600
-          if [ "$hhmm" -lt "$RTH_START" ] || [ "$hhmm" -ge "$RTH_END" ]; then
-            echo "Outside RTH: now=$hhmm NY -> exit OK"
-            exit 0
-          fi
-
-          echo "Inside RTH: now=$hhmm NY -> running endpoints"
 
           get_json() {
             local path="$1"
@@ -60,8 +44,7 @@ jobs:
             local method="$1"
             local path="$2"
             local url="${BASE_URL}${path}"
-            local tmp_body http_code snippet
-
+            local tmp_body
             tmp_body="$(mktemp)"
 
             http_code=$(
@@ -84,34 +67,58 @@ jobs:
             fi
           }
 
-          # 1) Set execution mode AUTO
-          call_method "POST" "/config/execution-mode?mode=auto"
+          # ============================================================
+          # A) FIJA CONFIG SIEMPRE (24/5). Esto elimina el "manual/low fantasma".
+          # ============================================================
 
-          # 2) Set risk mode MEDIUM
+          call_method "POST" "/config/execution-mode?mode=auto"
           call_method "POST" "/config/risk-mode?mode=medium"
 
-          # 3) Validate config
           cfg="$(get_json "/config/status")"
           mode="$(echo "$cfg" | jq -r '.execution_mode // empty')"
           risk="$(echo "$cfg" | jq -r '.risk_mode // empty')"
           echo "CHECK config/status -> execution_mode=${mode} risk_mode=${risk}"
 
           if [ "$mode" != "auto" ]; then
-            echo "FAIL: execution_mode is not auto"
+            echo "FAIL: execution_mode is not auto after POST /config/execution-mode"
             echo "CFG_SNIPPET: $(echo "$cfg" | head -c 400 | tr '\n' ' ')"
             exit 1
           fi
 
           if [ "$risk" != "medium" ]; then
-            echo "FAIL: risk_mode is not medium"
+            echo "FAIL: risk_mode is not medium after POST /config/risk-mode"
             echo "CFG_SNIPPET: $(echo "$cfg" | head -c 400 | tr '\n' ' ')"
             exit 1
           fi
 
-          # 4) Run scan
+          # ============================================================
+          # B) SOLO EJECUTA TRADING LOGIC DENTRO DE RTH (NY 09:30–16:00)
+          # ============================================================
+
+          TZ="America/New_York"
+          dow=$(TZ=$TZ date +%u)         # 1..7 (Mon..Sun)
+          hhmm=$(TZ=$TZ date +%H%M)      # 0000..2359
+          now_iso=$(TZ=$TZ date +"%Y-%m-%d %H:%M:%S %Z")
+          echo "NY_TIME=$now_iso (dow=$dow hhmm=$hhmm)"
+
+          # Weekend guard
+          if [ "$dow" -ge 6 ]; then
+            echo "Weekend -> config fixed already, skip trading logic"
+            exit 0
+          fi
+
+          # RTH window (09:30–16:00)
+          RTH_START=0930
+          RTH_END=1600
+          if [ "$hhmm" -lt "$RTH_START" ] || [ "$hhmm" -ge "$RTH_END" ]; then
+            echo "Outside RTH -> config fixed already, skip trading logic"
+            exit 0
+          fi
+
+          echo "Inside RTH: running /agent/scan + /monitor/tick"
+
           call_method "GET" "/agent/scan"
 
-          # 5) Tick
           tick="$(get_json "/monitor/tick")"
           tstatus="$(echo "$tick" | jq -r '.status // empty')"
           treason="$(echo "$tick" | jq -r '.reason // empty')"
