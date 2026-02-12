@@ -14,117 +14,118 @@ jobs:
         env:
           BASE_URL: ${{ secrets.BDV_BASE_URL }}
           BDV_AGENT_SECRET: ${{ secrets.BDV_AGENT_SECRET }}
-       run: |
-  set -euo pipefail
+        run: |
+          set -euo pipefail
 
-  sudo apt-get update -y
-  sudo apt-get install -y jq
+          sudo apt-get update -y
+          sudo apt-get install -y jq
 
-  if [ -z "${BASE_URL:-}" ]; then
-    echo "FAIL: BASE_URL is EMPTY"
-    exit 1
-  fi
+          if [ -z "${BASE_URL:-}" ]; then
+            echo "FAIL: BASE_URL is EMPTY" >&2
+            exit 1
+          fi
 
-  if [ -z "${BDV_AGENT_SECRET:-}" ]; then
-    echo "FAIL: BDV_AGENT_SECRET is EMPTY"
-    exit 1
-  fi
+          if [ -z "${BDV_AGENT_SECRET:-}" ]; then
+            echo "FAIL: BDV_AGENT_SECRET is EMPTY" >&2
+            exit 1
+          fi
 
-  # Normaliza BASE_URL (sin slash final)
-  BASE_URL="${BASE_URL%/}"
+          echo "BASE_URL_HOST=$(echo "$BASE_URL" | sed -E 's#https?://##' | cut -d/ -f1)" >&2
+          echo "BDV_AGENT_SECRET_LEN=${#BDV_AGENT_SECRET}" >&2
 
-  echo "BASE_URL_HOST=$(echo "$BASE_URL" | sed -E 's#https?://##' | cut -d/ -f1)"
-  echo "BDV_AGENT_SECRET_LEN=${#BDV_AGENT_SECRET}"
+          TZ="America/New_York"
+          dow=$(TZ=$TZ date +%u)         # 1..7
+          hhmm=$(TZ=$TZ date +%H%M)      # 0000..2359
+          now_iso=$(TZ=$TZ date +"%Y-%m-%d %H:%M:%S %Z")
+          echo "NY_TIME=$now_iso (dow=$dow hhmm=$hhmm)" >&2
 
-  TZ="America/New_York"
-  dow=$(TZ=$TZ date +%u)         # 1..7
-  hhmm=$(TZ=$TZ date +%H%M)      # 0000..2359
-  now_iso=$(TZ=$TZ date +"%Y-%m-%d %H:%M:%S %Z")
-  echo "NY_TIME=$now_iso (dow=$dow hhmm=$hhmm)"
+          if [ "$dow" -ge 6 ]; then
+            echo "Outside RTH (weekend) -> exit OK" >&2
+            exit 0
+          fi
 
-  if [ "$dow" -ge 6 ]; then
-    echo "Outside RTH (weekend) -> exit OK"
-    exit 0
-  fi
+          RTH_START=0930
+          RTH_END=1600
+          if [ "$hhmm" -lt "$RTH_START" ] || [ "$hhmm" -ge "$RTH_END" ]; then
+            echo "Outside RTH: now=$hhmm NY -> exit OK" >&2
+            exit 0
+          fi
 
-  RTH_START=0930
-  RTH_END=1600
-  if [ "$hhmm" -lt "$RTH_START" ] || [ "$hhmm" -ge "$RTH_END" ]; then
-    echo "Outside RTH: now=$hhmm NY -> exit OK"
-    exit 0
-  fi
+          echo "Inside RTH: now=$hhmm NY -> running endpoints" >&2
 
-  echo "Inside RTH: now=$hhmm NY -> running endpoints"
+          curl_json() {
+            local method="$1"
+            local path="$2"
+            local url="${BASE_URL}${path}"
+            local tmp_body http_code snippet
 
-  curl_json() {
-    local method="$1"
-    local path="$2"
-    local url="${BASE_URL}${path}"
-    local tmp_body
-    tmp_body="$(mktemp)"
+            tmp_body="$(mktemp)"
 
-    local http_code
-    http_code=$(
-      curl -sS -o "$tmp_body" -w "%{http_code}" \
-        -X "$method" \
-        -H "X-BDV-SECRET: ${BDV_AGENT_SECRET}" \
-        -H "accept: application/json" \
-        --retry 2 --retry-delay 1 --retry-connrefused \
-        --connect-timeout 10 --max-time 30 \
-        "$url" || echo "000"
-    )
+            http_code=$(
+              curl -sS -o "$tmp_body" -w "%{http_code}" \
+                -X "$method" \
+                -H "X-BDV-SECRET: ${BDV_AGENT_SECRET}" \
+                -H "accept: application/json" \
+                -H "Content-Type: application/json" \
+                --retry 2 --retry-delay 1 --retry-connrefused \
+                --connect-timeout 10 --max-time 30 \
+                "$url" || echo "000"
+            )
 
-    local snippet
-    snippet=$(head -c 300 "$tmp_body" | tr '\n' ' ' | sed 's/  */ /g')
-    echo "ENDPOINT ${method} ${path} -> http_code=${http_code} | body_snippet=${snippet}"
+            snippet="$(head -c 300 "$tmp_body" | tr '\n' ' ' | sed 's/  */ /g')"
+            echo "ENDPOINT ${method} ${path} -> http_code=${http_code} | body_snippet=${snippet}" >&2
 
-    if [ "$http_code" != "200" ]; then
-      echo "FAIL: ${method} ${path} returned ${http_code}"
-      echo "BODY_START"
-      cat "$tmp_body"
-      echo "BODY_END"
-      rm -f "$tmp_body"
-      exit 1
-    fi
+            if [ "$http_code" != "200" ]; then
+              echo "FAIL: ${method} ${path} returned ${http_code}" >&2
+              echo "BODY_START" >&2
+              cat "$tmp_body" >&2
+              echo "BODY_END" >&2
+              rm -f "$tmp_body"
+              exit 1
+            fi
 
-    cat "$tmp_body"
-    rm -f "$tmp_body"
-  }
+            cat "$tmp_body"
+            rm -f "$tmp_body"
+          }
 
-  # 1) Set AUTO
-  curl_json "POST" "/config/execution-mode?mode=auto" >/dev/null
+          # 1) Set AUTO
+          curl_json "POST" "/config/execution-mode?mode=auto" >/dev/null
 
-  # 2) Set MEDIUM
-  curl_json "POST" "/config/risk-mode?mode=medium" >/dev/null
+          # 2) Set MEDIUM
+          curl_json "POST" "/config/risk-mode?mode=medium" >/dev/null
 
-  # 3) Verify status (y si no es JSON, fallará antes por http_code != 200)
-  cfg="$(curl_json "GET" "/config/status")"
-  mode="$(echo "$cfg" | jq -r '.execution_mode // empty')"
-  risk="$(echo "$cfg" | jq -r '.risk_mode // empty')"
-  echo "CHECK config/status -> execution_mode=${mode} risk_mode=${risk}"
+          # 3) Verify status (JSON puro)
+          cfg="$(curl_json "GET" "/config/status")"
+          echo "$cfg" | jq -e . >/dev/null
 
-  if [ "$mode" != "auto" ]; then
-    echo "FAIL: execution_mode is not auto"
-    exit 1
-  fi
+          mode="$(echo "$cfg" | jq -r '.execution_mode // empty')"
+          risk="$(echo "$cfg" | jq -r '.risk_mode // empty')"
+          trades="$(echo "$cfg" | jq -r '.trades_today // empty')"
+          echo "CHECK config/status -> execution_mode=${mode} risk_mode=${risk} trades_today=${trades}" >&2
 
-  if [ "$risk" != "medium" ]; then
-    echo "FAIL: risk_mode is not medium"
-    exit 1
-  fi
+          if [ "$mode" != "auto" ]; then
+            echo "FAIL: execution_mode is not auto" >&2
+            exit 1
+          fi
+          if [ "$risk" != "medium" ]; then
+            echo "FAIL: risk_mode is not medium" >&2
+            exit 1
+          fi
 
-  # 4) Scan
-  curl_json "GET" "/agent/scan" >/dev/null
+          # 4) Scan
+          curl_json "GET" "/agent/scan" >/dev/null
 
-  # 5) Tick (aquí es donde tú estabas viendo 401)
-  tick="$(curl_json "GET" "/monitor/tick")"
-  tstatus="$(echo "$tick" | jq -r '.status // empty')"
-  treason="$(echo "$tick" | jq -r '.reason // empty')"
-  echo "CHECK monitor/tick -> status=${tstatus} reason=${treason}"
+          # 5) Tick
+          tick="$(curl_json "GET" "/monitor/tick")"
+          echo "$tick" | jq -e . >/dev/null
 
-  if [ "$tstatus" = "skipped" ]; then
-    echo "FAIL: monitor/tick skipped inside RTH -> ${treason}"
-    exit 1
-  fi
+          tstatus="$(echo "$tick" | jq -r '.status // empty')"
+          treason="$(echo "$tick" | jq -r '.reason // empty')"
+          echo "CHECK monitor/tick -> status=${tstatus} reason=${treason}" >&2
 
-  echo "All checks OK inside RTH."
+          if [ "$tstatus" = "skipped" ]; then
+            echo "FAIL: monitor/tick skipped inside RTH -> ${treason}" >&2
+            exit 1
+          fi
+
+          echo "All checks OK inside RTH." >&2
