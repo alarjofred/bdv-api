@@ -3,7 +3,7 @@
 from fastapi import APIRouter, HTTPException, Header
 import os
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -19,6 +19,15 @@ TRADING_URL = _raw_trading[:-3] if _raw_trading.endswith("/v2") else _raw_tradin
 
 # Seguridad: el cron/agente debe enviar este header
 BDV_AGENT_SECRET = os.getenv("BDV_AGENT_SECRET", "").strip()
+
+# ✅ Anti-duplicados / cooldown simple en memoria (por proceso Render)
+# Nota: si Render reinicia, se borra. Aun así ayuda contra spam.
+_LAST_ENTRY: Dict[str, Any] = {
+    "ts": None,       # datetime UTC
+    "symbol": None,   # "SPY"
+    "side": None,     # "buy"/"sell"
+}
+AUTO_ENTRY_COOLDOWN_SEC = int(os.getenv("AUTO_ENTRY_COOLDOWN_SEC", "900"))  # 15 min default
 
 
 def _require_agent_secret(x_bdv_secret: Optional[str]) -> None:
@@ -36,7 +45,6 @@ def _api_headers() -> Dict[str, str]:
         "Accept": "application/json",
         "Content-Type": "application/json",
     }
-    # Si tu API protege endpoints internos con X-BDV-SECRET, lo mandamos
     if BDV_AGENT_SECRET:
         h["X-BDV-SECRET"] = BDV_AGENT_SECRET
     return h
@@ -129,6 +137,7 @@ def close_symbol_via_api(symbol: str) -> Dict[str, Any]:
     if not API_BASE:
         raise HTTPException(status_code=500, detail="RENDER_EXTERNAL_URL no definido para /alpaca/close/{symbol}")
 
+    symbol = str(symbol).strip().upper()
     resp = requests.post(f"{API_BASE}/alpaca/close/{symbol}", headers=_api_headers(), timeout=10)
     try:
         return resp.json()
@@ -144,6 +153,10 @@ def _execute_trade_via_http(symbol: str, side: str, qty: int) -> Dict[str, Any]:
     """
     if not API_BASE:
         return {"status": "error", "detail": "API_BASE missing"}
+
+    symbol = str(symbol).strip().upper()
+    side = str(side).lower().strip()
+    qty = int(qty)
 
     url = f"{API_BASE.rstrip('/')}/trade"
     payload = {"symbol": symbol, "side": side, "qty": qty}
@@ -210,12 +223,10 @@ def _process_pending_trades(snapshot_data: Dict[str, Dict[str, Any]], allow_exec
         if not condition_met:
             continue
 
-        # Trigger detectado
         if allow_execute:
             out = _execute_trade_via_http(trade.symbol, trade.side, trade.qty)
             trade.status = "triggered"
             trade.triggered_at = now
-            status = "triggered"
             ejecuciones.append(
                 {
                     "id": trade.id,
@@ -225,7 +236,7 @@ def _process_pending_trades(snapshot_data: Dict[str, Dict[str, Any]], allow_exec
                     "trigger_price": trade.trigger_price,
                     "max_price": trade.max_price,
                     "price_at_trigger": price,
-                    "status": status,
+                    "status": "triggered",
                     "trade_result": out,
                 }
             )
@@ -263,7 +274,7 @@ def _get_recommendation() -> Dict[str, Any]:
 
 def _pick_trade_from_recommend(rec_payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
-    Busca la primera recomendación que no sea 'wait' y la convierte a {symbol, side}.
+    Busca la primera recomendación BUY/SELL y la convierte a {symbol, side, source}.
     """
     if not isinstance(rec_payload, dict):
         return None
@@ -274,16 +285,106 @@ def _pick_trade_from_recommend(rec_payload: Dict[str, Any]) -> Optional[Dict[str
             sug = str(r.get("suggestion", "")).lower().strip()
             sym = r.get("symbol")
             if sym and sug in ("buy", "sell"):
-                return {"symbol": sym, "side": sug}
+                return {"symbol": str(sym).strip().upper(), "side": sug, "source": "recommend"}
         return None
 
-    # fallback por si viene plano
     sug = str(rec_payload.get("suggestion", "")).lower().strip()
     sym = rec_payload.get("symbol")
     if sym and sug in ("buy", "sell"):
-        return {"symbol": sym, "side": sug}
+        return {"symbol": str(sym).strip().upper(), "side": sug, "source": "recommend"}
 
     return None
+
+
+def _get_signals_ai() -> Dict[str, Any]:
+    """
+    Llama /signals/ai y devuelve el JSON.
+    """
+    if not API_BASE:
+        return {}
+    try:
+        r = requests.get(f"{API_BASE}/signals/ai", headers=_api_headers(), timeout=10)
+        if r.status_code != 200:
+            return {"status": "error", "http": r.status_code, "body": r.text}
+        return r.json()
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
+
+
+def _pick_trade_from_signals_ai(ai_payload: Dict[str, Any], min_conf: float = 0.6) -> Optional[Dict[str, Any]]:
+    """
+    Solo devuelve pick si AI es EJECUTABLE.
+    Criterio ejecutable:
+      - structure.kind != "none"
+      - legs no vacío
+      - confidence >= min_conf
+      - y que exista symbol + side sugerido para ACCIONES (buy/sell)
+    Nota: Si AI describe opciones, aquí SOLO lo registramos (no ejecutamos opciones).
+    """
+    if not isinstance(ai_payload, dict):
+        return None
+
+    # soporte por si viene envuelto
+    data = ai_payload.get("data", ai_payload)
+
+    # Señales típicas auditadas antes
+    structure = data.get("structure", {}) if isinstance(data.get("structure"), dict) else {}
+    kind = str(structure.get("kind", "")).lower().strip()
+    legs = structure.get("legs", []) if isinstance(structure.get("legs"), list) else data.get("legs", [])
+
+    try:
+        conf = float(data.get("confidence", 0) or 0)
+    except Exception:
+        conf = 0.0
+
+    # Si no es ejecutable → None (y dejamos que monitor haga fallback)
+    if kind in ("", "none") or not legs or conf < min_conf:
+        return None
+
+    # Intento de extraer una instrucción simple stock (si existiera)
+    # Buscamos campos comunes: symbol + side/suggestion/action
+    sym = data.get("symbol") or data.get("ticker")
+    side = data.get("side") or data.get("suggestion") or data.get("action")
+
+    if sym and side:
+        side = str(side).lower().strip()
+        if side in ("buy", "sell"):
+            return {"symbol": str(sym).strip().upper(), "side": side, "source": "signals_ai", "confidence": conf, "kind": kind}
+
+    # Si AI es ejecutable pero NO trae instrucción stock simple, no ejecutamos (probablemente es options)
+    return {"status": "not_supported", "source": "signals_ai", "confidence": conf, "kind": kind, "reason": "ai_executable_but_not_stock_order"}
+
+
+def _cooldown_allows(symbol: str, side: str) -> Tuple[bool, str]:
+    """
+    Evita repetir órdenes iguales cada 5 min.
+    """
+    now = datetime.utcnow()
+    last_ts = _LAST_ENTRY.get("ts")
+    last_sym = _LAST_ENTRY.get("symbol")
+    last_side = _LAST_ENTRY.get("side")
+
+    symbol = str(symbol).strip().upper()
+    side = str(side).lower().strip()
+
+    if not last_ts:
+        return True, "no_last_entry"
+
+    try:
+        elapsed = (now - last_ts).total_seconds()
+    except Exception:
+        return True, "bad_last_ts"
+
+    if last_sym == symbol and last_side == side and elapsed < AUTO_ENTRY_COOLDOWN_SEC:
+        return False, f"cooldown_active {int(elapsed)}s<{AUTO_ENTRY_COOLDOWN_SEC}s"
+
+    return True, f"cooldown_ok elapsed={int(elapsed)}s"
+
+
+def _set_last_entry(symbol: str, side: str) -> None:
+    _LAST_ENTRY["ts"] = datetime.utcnow()
+    _LAST_ENTRY["symbol"] = str(symbol).strip().upper()
+    _LAST_ENTRY["side"] = str(side).lower().strip()
 
 
 @router.get("/tick")
@@ -292,12 +393,11 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
     EJECUCIÓN / GESTIÓN (solo en auto):
     - close por hora / P&L / tp/sl
     - pending trades ejecuta /trade SOLO si auto
-    - AUTO ENTRY: si NO hay posiciones y /recommend da buy/sell -> ejecuta 1 trade
+    - AUTO ENTRY: prioriza /signals/ai si es ejecutable; si no, fallback /recommend
     Protegido por X-BDV-SECRET si BDV_AGENT_SECRET está definido.
     """
     _require_agent_secret(x_bdv_secret)
 
-    # 0) Guard horario NY (por si alguien llama fuera de RTH)
     inside, rth_reason = _is_inside_rth()
     if not inside:
         return {"status": "skipped", "reason": rth_reason}
@@ -320,7 +420,6 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
             },
         }
 
-    # 1) Solo en auto tocamos Alpaca
     account, positions = get_account_and_positions()
     equity = float(account.get("equity", 0.0))
     last_equity = float(account.get("last_equity", equity))
@@ -337,7 +436,8 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
         "per_trade_params": {"tp_per_trade": params["tp_per_trade"], "sl_per_trade": params["sl_per_trade"]},
         "daily_params": {"target_pct": params["daily_target"], "max_loss_pct": params["daily_max_loss"], "pnl_today": pnl_today},
         "pending_trades_executed": [],
-        "auto_entry": None,  # aquí queda el resultado del intento de entrada
+        # ✅ nunca dejarlo null: default "skipped"
+        "auto_entry": {"status": "skipped", "reason": "not_evaluated"},
         "limits": {"max_trades_per_day": max_trades_per_day, "trades_today": trades_today},
     }
 
@@ -347,21 +447,24 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
         actions["closed_all"] = True
         actions["reason_all"] = "Hora límite 15:45 NY"
         actions["close_all_response"] = result
-        return {"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "actions": actions}
+        actions["auto_entry"] = {"status": "skipped", "reason": "positions_exist_close_logic"}
+        return {"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "positions_count": len(positions), "actions": actions}
 
     if positions and pnl_today >= daily_target_abs:
         result = close_all_via_api()
         actions["closed_all"] = True
         actions["reason_all"] = "Meta diaria alcanzada"
         actions["close_all_response"] = result
-        return {"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "actions": actions}
+        actions["auto_entry"] = {"status": "skipped", "reason": "positions_exist_daily_target"}
+        return {"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "positions_count": len(positions), "actions": actions}
 
     if positions and pnl_today <= daily_max_loss_abs:
         result = close_all_via_api()
         actions["closed_all"] = True
         actions["reason_all"] = "Pérdida diaria máxima alcanzada"
         actions["close_all_response"] = result
-        return {"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "actions": actions}
+        actions["auto_entry"] = {"status": "skipped", "reason": "positions_exist_daily_max_loss"}
+        return {"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "positions_count": len(positions), "actions": actions}
 
     # 3) TP/SL por posición
     for pos in positions:
@@ -388,26 +491,69 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
     except Exception:
         actions["pending_trades_executed"] = []
 
-    # 5) ✅ AUTO ENTRY (solo si NO hay posiciones)
-    #    - respeta max_trades_per_day
-    #    - usa /recommend
-    if len(positions) == 0:
-        if trades_today >= max_trades_per_day:
-            actions["auto_entry"] = {"status": "skipped", "reason": "max_trades_per_day_reached"}
-        else:
-            rec = _get_recommendation()
-            pick = _pick_trade_from_recommend(rec if isinstance(rec, dict) else {})
-            if not pick:
-                actions["auto_entry"] = {"status": "skipped", "reason": "no_trade_signal", "recommend": rec}
-            else:
-                # qty mínimo hoy (acciones). Si quieres escalar luego, lo hacemos por modo de riesgo.
-                qty = 1
-                out = _execute_trade_via_http(pick["symbol"], pick["side"], qty)
-                actions["auto_entry"] = {
-                    "status": "attempted",
-                    "picked": pick,
-                    "qty": qty,
-                    "trade_result": out,
-                }
+    # 5) ✅ AUTO ENTRY: SOLO si NO hay posiciones
+    if len(positions) != 0:
+        actions["auto_entry"] = {"status": "skipped", "reason": "positions_exist", "positions_count": len(positions)}
+        return {"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "positions_count": len(positions), "actions": actions}
 
-    return {"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "positions_count": len(positions), "actions": actions}
+    if trades_today >= max_trades_per_day:
+        actions["auto_entry"] = {"status": "skipped", "reason": "max_trades_per_day_reached"}
+        return {"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "positions_count": 0, "actions": actions}
+
+    # 5.A) Intento con /signals/ai (prioridad 1)
+    ai = _get_signals_ai()
+    ai_pick = _pick_trade_from_signals_ai(ai, min_conf=float(os.getenv("AI_MIN_CONFIDENCE", "0.6")))
+
+    # Si AI devuelve dict con status not_supported, lo registramos y fallback
+    if isinstance(ai_pick, dict) and ai_pick.get("status") == "not_supported":
+        actions["auto_entry"] = {"status": "skipped", "reason": "ai_not_supported_for_stock", "signals_ai": ai, "ai_pick": ai_pick}
+    elif isinstance(ai_pick, dict) and ai_pick.get("symbol") and ai_pick.get("side") and ai_pick.get("source") == "signals_ai":
+        # Dedupe/cooldown
+        ok_cd, cd_reason = _cooldown_allows(ai_pick["symbol"], ai_pick["side"])
+        if not ok_cd:
+            actions["auto_entry"] = {"status": "skipped", "reason": cd_reason, "picked": ai_pick, "source": "signals_ai", "signals_ai": ai}
+            return {"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "positions_count": 0, "actions": actions}
+
+        qty = 1
+        out = _execute_trade_via_http(ai_pick["symbol"], ai_pick["side"], qty)
+        if out.get("status") == "ok":
+            _set_last_entry(ai_pick["symbol"], ai_pick["side"])
+        actions["auto_entry"] = {
+            "status": "attempted",
+            "source": "signals_ai",
+            "picked": ai_pick,
+            "qty": qty,
+            "trade_result": out,
+            "signals_ai": ai,
+        }
+        return {"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "positions_count": 0, "actions": actions}
+
+    # 5.B) Fallback a /recommend (prioridad 2)
+    rec = _get_recommendation()
+    pick = _pick_trade_from_recommend(rec if isinstance(rec, dict) else {})
+
+    if not pick:
+        actions["auto_entry"] = {"status": "skipped", "reason": "no_trade_signal", "recommend": rec, "signals_ai": ai}
+        return {"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "positions_count": 0, "actions": actions}
+
+    ok_cd, cd_reason = _cooldown_allows(pick["symbol"], pick["side"])
+    if not ok_cd:
+        actions["auto_entry"] = {"status": "skipped", "reason": cd_reason, "picked": pick, "source": "recommend", "recommend": rec, "signals_ai": ai}
+        return {"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "positions_count": 0, "actions": actions}
+
+    qty = 1
+    out = _execute_trade_via_http(pick["symbol"], pick["side"], qty)
+    if out.get("status") == "ok":
+        _set_last_entry(pick["symbol"], pick["side"])
+
+    actions["auto_entry"] = {
+        "status": "attempted",
+        "source": "recommend",
+        "picked": pick,
+        "qty": qty,
+        "trade_result": out,
+        "recommend": rec,
+        "signals_ai": ai,
+    }
+
+    return {"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "positions_count": 0, "actions": actions}
