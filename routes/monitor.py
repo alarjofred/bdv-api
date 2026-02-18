@@ -21,13 +21,6 @@ BDV_AGENT_SECRET = os.getenv("BDV_AGENT_SECRET", "").strip()
 # ✅ Build id para verificar que Swagger/Cron pegan al mismo deploy
 BUILD_ID = os.getenv("BUILD_ID", "unknown")
 
-# ✅ Anti-duplicados / cooldown simple en memoria (por proceso Render)
-_LAST_ENTRY: Dict[str, Any] = {
-    "ts": None,       # datetime UTC naive
-    "symbol": None,   # "SPY"
-    "side": None,     # "buy"/"sell"
-}
-
 def _env_int(name: str, default: int) -> int:
     try:
         return int(str(os.getenv(name, str(default))).strip())
@@ -47,6 +40,13 @@ AI_MIN_CONFIDENCE = _env_float("AI_MIN_CONFIDENCE", 0.75)
 def _bool_env(name: str, default: bool = False) -> bool:
     raw = os.getenv(name, "true" if default else "false")
     return str(raw).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+# ✅ Anti-duplicados / cooldown 100% “suavizado por símbolo” (por proceso Render)
+# Guarda último ts por key = "{SYMBOL}:{SIDE}" (ej: "QQQ:buy")
+_LAST_ENTRY_BY_KEY: Dict[str, Dict[str, Any]] = {
+    # "QQQ:buy": {"ts": datetime.utcnow()},
+}
 
 
 def _require_agent_secret(x_bdv_secret: Optional[str]) -> None:
@@ -442,42 +442,45 @@ def _summarize_ai(ai_payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+# =========================
+# ✅ COOLDOWN POR SÍMBOLO+SIDE
+# =========================
+def _cooldown_key(symbol: str, side: str) -> str:
+    return f"{str(symbol).strip().upper()}:{str(side).strip().lower()}"
+
 def _cooldown_state(symbol: str, side: str) -> Dict[str, Any]:
     """
     Estado de cooldown para logs: allow + remaining_sec + reason.
+    Cooldown por símbolo+side (no global).
     """
     now = datetime.utcnow()
-    last_ts = _LAST_ENTRY.get("ts")
-    last_sym = _LAST_ENTRY.get("symbol")
-    last_side = _LAST_ENTRY.get("side")
+    key = _cooldown_key(symbol, side)
 
-    symbol_u = str(symbol).strip().upper()
-    side_l = str(side).lower().strip()
+    last = _LAST_ENTRY_BY_KEY.get(key)
+    if not last or not isinstance(last, dict) or not last.get("ts"):
+        return {"allow": True, "reason": "no_last_entry_for_key", "remaining_sec": 0, "key": key}
 
-    if not last_ts:
-        return {"allow": True, "reason": "no_last_entry", "remaining_sec": 0}
-
+    last_ts = last.get("ts")
     try:
         elapsed = (now - last_ts).total_seconds()
     except Exception:
-        return {"allow": True, "reason": "bad_last_ts", "remaining_sec": 0}
+        return {"allow": True, "reason": "bad_last_ts", "remaining_sec": 0, "key": key}
 
-    if last_sym == symbol_u and last_side == side_l and elapsed < AUTO_ENTRY_COOLDOWN_SEC:
+    if elapsed < AUTO_ENTRY_COOLDOWN_SEC:
         remaining = int(max(0, AUTO_ENTRY_COOLDOWN_SEC - elapsed))
         return {
             "allow": False,
             "reason": f"cooldown_active elapsed={int(elapsed)}s<{AUTO_ENTRY_COOLDOWN_SEC}s",
             "remaining_sec": remaining,
-            "last": {"symbol": last_sym, "side": last_side, "ts": str(last_ts)},
+            "key": key,
+            "last": {"ts": str(last_ts)},
         }
 
-    return {"allow": True, "reason": f"cooldown_ok elapsed={int(elapsed)}s", "remaining_sec": 0}
-
+    return {"allow": True, "reason": f"cooldown_ok elapsed={int(elapsed)}s", "remaining_sec": 0, "key": key}
 
 def _set_last_entry(symbol: str, side: str) -> None:
-    _LAST_ENTRY["ts"] = datetime.utcnow()
-    _LAST_ENTRY["symbol"] = str(symbol).strip().upper()
-    _LAST_ENTRY["side"] = str(side).lower().strip()
+    key = _cooldown_key(symbol, side)
+    _LAST_ENTRY_BY_KEY[key] = {"ts": datetime.utcnow()}
 
 
 @router.get("/tick")
@@ -514,6 +517,7 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
         "limits": {"max_trades_per_day": max_trades_per_day, "trades_today": trades_today},
         "guardrails": {
             "cooldown_sec": AUTO_ENTRY_COOLDOWN_SEC,
+            "cooldown_scope": "per_symbol_side",  # ✅ deja explícito el tipo de suavizado
             "ai_min_conf": AI_MIN_CONFIDENCE,
             "ai_trend_min": AI_TREND_MIN,
             "ai_symbols": _ai_symbols(),
@@ -560,7 +564,13 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
         actions["reason_all"] = "Hora límite 15:45 NY"
         actions["close_all_response"] = result
         actions["auto_entry"] = {"status": "skipped", "reason": "positions_exist_close_logic"}
-        return _with_build_id({"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "positions_count": len(positions), "actions": actions})
+        return _with_build_id({
+            "status": "ok",
+            "mode": exec_mode,
+            "risk_mode": risk_mode,
+            "positions_count": len(positions),
+            "actions": actions
+        })
 
     if positions and pnl_today >= daily_target_abs:
         result = close_all_via_api()
@@ -568,7 +578,13 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
         actions["reason_all"] = "Meta diaria alcanzada"
         actions["close_all_response"] = result
         actions["auto_entry"] = {"status": "skipped", "reason": "positions_exist_daily_target"}
-        return _with_build_id({"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "positions_count": len(positions), "actions": actions})
+        return _with_build_id({
+            "status": "ok",
+            "mode": exec_mode,
+            "risk_mode": risk_mode,
+            "positions_count": len(positions),
+            "actions": actions
+        })
 
     if positions and pnl_today <= daily_max_loss_abs:
         result = close_all_via_api()
@@ -576,7 +592,13 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
         actions["reason_all"] = "Pérdida diaria máxima alcanzada"
         actions["close_all_response"] = result
         actions["auto_entry"] = {"status": "skipped", "reason": "positions_exist_daily_max_loss"}
-        return _with_build_id({"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "positions_count": len(positions), "actions": actions})
+        return _with_build_id({
+            "status": "ok",
+            "mode": exec_mode,
+            "risk_mode": risk_mode,
+            "positions_count": len(positions),
+            "actions": actions
+        })
 
     # 3) TP/SL por posición
     for pos in positions:
@@ -606,11 +628,23 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
     # 5) ✅ AUTO ENTRY: SOLO si NO hay posiciones
     if len(positions) != 0:
         actions["auto_entry"] = {"status": "skipped", "reason": "positions_exist", "positions_count": len(positions)}
-        return _with_build_id({"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "positions_count": len(positions), "actions": actions})
+        return _with_build_id({
+            "status": "ok",
+            "mode": exec_mode,
+            "risk_mode": risk_mode,
+            "positions_count": len(positions),
+            "actions": actions
+        })
 
     if trades_today >= max_trades_per_day:
         actions["auto_entry"] = {"status": "skipped", "reason": "max_trades_per_day_reached", "limits": actions["limits"]}
-        return _with_build_id({"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "positions_count": 0, "actions": actions})
+        return _with_build_id({
+            "status": "ok",
+            "mode": exec_mode,
+            "risk_mode": risk_mode,
+            "positions_count": 0,
+            "actions": actions
+        })
 
     # 5.A) Intento con /signals/ai (prioridad 1) evaluando varios símbolos
     ai_checked_summary: List[Dict[str, Any]] = []
