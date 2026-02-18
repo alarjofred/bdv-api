@@ -1,5 +1,3 @@
-# routes/monitor.py
-
 from fastapi import APIRouter, HTTPException, Header
 import os
 import requests
@@ -24,30 +22,18 @@ BDV_AGENT_SECRET = os.getenv("BDV_AGENT_SECRET", "").strip()
 BUILD_ID = os.getenv("BUILD_ID", "unknown")
 
 # ✅ Anti-duplicados / cooldown simple en memoria (por proceso Render)
-# Nota: si Render reinicia, se borra. Aun así ayuda contra spam.
-_LAST_ENTRY: Dict[str, Any] = {
-    "ts": None,       # datetime UTC naive
-    "symbol": None,   # "SPY"
-    "side": None,     # "buy"/"sell"
-}
+_LAST_ENTRY: Dict[str, Any] = {"ts": None, "symbol": None, "side": None}
 AUTO_ENTRY_COOLDOWN_SEC = int(os.getenv("AUTO_ENTRY_COOLDOWN_SEC", "900"))  # 15 min default
 
 
 def _require_agent_secret(x_bdv_secret: Optional[str]) -> None:
-    """
-    Protege endpoints del agente/monitor contra llamadas externas no autorizadas.
-    Si BDV_AGENT_SECRET está definido, exige header X-BDV-SECRET.
-    """
     if BDV_AGENT_SECRET:
         if not x_bdv_secret or x_bdv_secret.strip() != BDV_AGENT_SECRET:
             raise HTTPException(status_code=401, detail="Unauthorized: missing/invalid X-BDV-SECRET")
 
 
 def _api_headers() -> Dict[str, str]:
-    h = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-    }
+    h = {"Accept": "application/json", "Content-Type": "application/json"}
     if BDV_AGENT_SECRET:
         h["X-BDV-SECRET"] = BDV_AGENT_SECRET
     return h
@@ -62,15 +48,8 @@ def get_alpaca_headers() -> Dict[str, str]:
     api_key = os.getenv("APCA_API_KEY_ID")
     api_secret = os.getenv("APCA_API_SECRET_KEY")
     if not api_key or not api_secret:
-        raise HTTPException(
-            status_code=500,
-            detail="Faltan APCA_API_KEY_ID o APCA_API_SECRET_KEY",
-        )
-    return {
-        "APCA-API-KEY-ID": api_key,
-        "APCA-API-SECRET-KEY": api_secret,
-        "Accept": "application/json",
-    }
+        raise HTTPException(status_code=500, detail="Faltan APCA_API_KEY_ID o APCA_API_SECRET_KEY")
+    return {"APCA-API-KEY-ID": api_key, "APCA-API-SECRET-KEY": api_secret, "Accept": "application/json"}
 
 
 def get_config_status() -> Dict[str, Any]:
@@ -110,19 +89,13 @@ def get_risk_params(risk_mode: str) -> Dict[str, float]:
 
 
 def is_after_close_time() -> bool:
-    """
-    True si hora NY >= 15:45. Maneja DST correctamente.
-    """
     now_ny = datetime.now(tz=ZoneInfo("America/New_York"))
     return (now_ny.hour > 15) or (now_ny.hour == 15 and now_ny.minute >= 45)
 
 
 def _is_inside_rth() -> Tuple[bool, str]:
-    """
-    RTH: 09:30 - 16:00 NY
-    """
     now_ny = datetime.now(tz=ZoneInfo("America/New_York"))
-    dow = int(now_ny.strftime("%u"))   # 1..7
+    dow = int(now_ny.strftime("%u"))  # 1..7
     hhmm = int(now_ny.strftime("%H%M"))
     if dow >= 6:
         return False, f"weekend {now_ny.isoformat()}"
@@ -134,7 +107,6 @@ def _is_inside_rth() -> Tuple[bool, str]:
 def close_all_via_api() -> Dict[str, Any]:
     if not API_BASE:
         raise HTTPException(status_code=500, detail="RENDER_EXTERNAL_URL no definido para /alpaca/close-all")
-
     resp = requests.post(f"{API_BASE}/alpaca/close-all", headers=_api_headers(), timeout=10)
     if resp.status_code not in (200, 207):
         raise HTTPException(status_code=resp.status_code, detail=f"Error /alpaca/close-all: {resp.text}")
@@ -156,9 +128,6 @@ def close_symbol_via_api(symbol: str) -> Dict[str, Any]:
 
 
 def _execute_trade_via_http(symbol: str, side: str, qty: int) -> Dict[str, Any]:
-    """
-    Ejecuta /trade (solo acciones hoy). Retorna respuesta o info de error (sin romper tick).
-    """
     if not API_BASE:
         return {"status": "error", "detail": "API_BASE missing"}
 
@@ -193,10 +162,6 @@ def _get_snapshot_prices() -> Dict[str, Dict[str, Any]]:
 
 
 def _process_pending_trades(snapshot_data: Dict[str, Dict[str, Any]], allow_execute: bool) -> List[Dict[str, Any]]:
-    """
-    allow_execute=False: solo detecta triggers y marca, NO ejecuta /trade.
-    allow_execute=True: ejecuta /trade.
-    """
     now = datetime.utcnow()
     ejecuciones: List[Dict[str, Any]] = []
 
@@ -207,15 +172,7 @@ def _process_pending_trades(snapshot_data: Dict[str, Dict[str, Any]], allow_exec
         if trade.valid_until and now > trade.valid_until:
             trade.status = "expired"
             trade.expired_at = now
-            ejecuciones.append(
-                {
-                    "id": trade.id,
-                    "symbol": trade.symbol,
-                    "side": trade.side,
-                    "status": "expired",
-                    "reason": "valid_until alcanzado",
-                }
-            )
+            ejecuciones.append({"id": trade.id, "symbol": trade.symbol, "side": trade.side, "status": "expired", "reason": "valid_until alcanzado"})
             continue
 
         info = snapshot_data.get(trade.symbol) or {}
@@ -235,40 +192,22 @@ def _process_pending_trades(snapshot_data: Dict[str, Dict[str, Any]], allow_exec
             out = _execute_trade_via_http(trade.symbol, trade.side, trade.qty)
             trade.status = "triggered"
             trade.triggered_at = now
-            ejecuciones.append(
-                {
-                    "id": trade.id,
-                    "symbol": trade.symbol,
-                    "side": trade.side,
-                    "qty": trade.qty,
-                    "trigger_price": trade.trigger_price,
-                    "max_price": trade.max_price,
-                    "price_at_trigger": price,
-                    "status": "triggered",
-                    "trade_result": out,
-                }
-            )
+            ejecuciones.append({
+                "id": trade.id, "symbol": trade.symbol, "side": trade.side, "qty": trade.qty,
+                "trigger_price": trade.trigger_price, "max_price": trade.max_price,
+                "price_at_trigger": price, "status": "triggered", "trade_result": out,
+            })
         else:
-            ejecuciones.append(
-                {
-                    "id": trade.id,
-                    "symbol": trade.symbol,
-                    "side": trade.side,
-                    "qty": trade.qty,
-                    "trigger_price": trade.trigger_price,
-                    "max_price": trade.max_price,
-                    "price_at_trigger": price,
-                    "status": "trigger_detected",
-                }
-            )
+            ejecuciones.append({
+                "id": trade.id, "symbol": trade.symbol, "side": trade.side, "qty": trade.qty,
+                "trigger_price": trade.trigger_price, "max_price": trade.max_price,
+                "price_at_trigger": price, "status": "trigger_detected",
+            })
 
     return ejecuciones
 
 
 def _get_recommendation() -> Dict[str, Any]:
-    """
-    Llama /recommend y devuelve el JSON (o {}).
-    """
     if not API_BASE:
         return {}
     try:
@@ -281,9 +220,6 @@ def _get_recommendation() -> Dict[str, Any]:
 
 
 def _pick_trade_from_recommend(rec_payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Busca la primera recomendación BUY/SELL y la convierte a {symbol, side, source}.
-    """
     if not isinstance(rec_payload, dict):
         return None
 
@@ -305,11 +241,6 @@ def _pick_trade_from_recommend(rec_payload: Dict[str, Any]) -> Optional[Dict[str
 
 
 def _ai_symbols() -> List[str]:
-    """
-    Lista de símbolos a evaluar con /signals/ai.
-    Configurable:
-      AI_SYMBOLS="QQQ,SPY,NVDA"
-    """
     raw = os.getenv("AI_SYMBOLS", "QQQ,SPY,NVDA")
     out: List[str] = []
     for s in raw.split(","):
@@ -321,79 +252,106 @@ def _ai_symbols() -> List[str]:
 
 def _get_signals_ai(symbol: str) -> Dict[str, Any]:
     """
-    Llama /signals/ai con query params (tu Swagger muestra que lo requiere).
+    Llama /signals/ai con query params (tipos correctos).
+    Defaults configurables por ENV para “suavizar” el sistema.
     """
     if not API_BASE:
         return {}
+
+    sym = str(symbol).strip().upper()
+
+    # Defaults "suaves" (puedes cambiar en Render env vars sin redeploy)
+    default_bias = os.getenv("AI_DEFAULT_BIAS", "bullish").strip().lower()  # bullish/bearish/neutral
+    default_trend = int(os.getenv("AI_DEFAULT_TREND_STRENGTH", "2"))        # 1..3
+    default_near_extreme = os.getenv("AI_DEFAULT_NEAR_EXTREME", "false").lower() in ("1", "true", "yes")
+    default_prefer_spreads = os.getenv("AI_DEFAULT_PREFER_SPREADS", "true").lower() in ("1", "true", "yes")
+
+    params = {
+        "symbol": sym,
+        "bias": default_bias,
+        "trend_strength": max(1, min(3, default_trend)),
+        "near_extreme": default_near_extreme,
+        "prefer_spreads": default_prefer_spreads,
+    }
+
     try:
-        params = {
-            "symbol": str(symbol).strip().upper(),
-            # defaults seguros; si tu endpoint acepta más, luego ajustamos
-            "bias": "neutral",
-            "trend_strength": 1,
-            "near_extreme": "false",
-            "prefer_spreads": "true",
-        }
         r = requests.get(f"{API_BASE}/signals/ai", headers=_api_headers(), params=params, timeout=12)
         if r.status_code != 200:
             return {"status": "error", "http": r.status_code, "body": r.text, "params": params}
-        return r.json()
+        out = r.json()
+        # adjunta params usados (aunque el endpoint ya traiga params_echo)
+        if isinstance(out, dict) and "params" not in out:
+            out["_monitor_params_used"] = params
+        return out
     except Exception as e:
-        return {"status": "error", "detail": str(e), "symbol": symbol}
+        return {"status": "error", "detail": str(e), "symbol": sym, "params": params}
 
 
 def _pick_trade_from_signals_ai(ai_payload: Dict[str, Any], min_conf: float = 0.6) -> Optional[Dict[str, Any]]:
     """
-    Solo devuelve pick si AI es EJECUTABLE para stock:
-      - confidence >= min_conf
-      - y action/side/suggestion = buy/sell
-    Nota:
-      - Si AI describe opciones (kind != none, legs, etc) lo marcamos como not_supported (no ejecutamos opciones aquí).
+    Consume tu contrato real de /signals/ai:
+      - action: buy/sell/wait (principal)
+      - confidence
+      - symbol
+    Además detecta caso "library missing" (strategy_code != no_trade pero confidence=0 y label no_trade).
     """
     if not isinstance(ai_payload, dict):
         return None
 
     data = ai_payload.get("data", ai_payload)
+    if not isinstance(data, dict):
+        return None
+
+    sym = (data.get("symbol") or "").strip().upper()
+    action = str(data.get("action", "") or "").strip().lower()
+    strategy_code = str(data.get("strategy_code", "") or "").strip()
+    human_label = str(data.get("human_label", "") or "").strip()
 
     try:
         conf = float(data.get("confidence", 0) or 0)
     except Exception:
         conf = 0.0
 
-    sym = data.get("symbol") or data.get("ticker")
-    side = data.get("side") or data.get("suggestion") or data.get("action")
+    # Detecta “choose_strategy_code devolvió algo, pero librería no lo tiene”
+    # Señal típica: strategy_code != no_trade PERO devuelve el human_label de no_trade y conf=0/kind none.
+    if strategy_code and strategy_code != "no_trade" and conf <= 0 and "Sin operación" in human_label:
+        return {
+            "status": "skipped",
+            "source": "signals_ai",
+            "reason": "strategy_library_missing_for_returned_strategy_code",
+            "symbol": sym or None,
+            "strategy_code": strategy_code,
+            "human_label": human_label,
+            "confidence": conf,
+            "action": action or "wait",
+        }
 
-    if sym and side:
-        side = str(side).lower().strip()
-        if side in ("buy", "sell") and conf >= min_conf:
-            return {
-                "symbol": str(sym).strip().upper(),
-                "side": side,
-                "source": "signals_ai",
-                "confidence": conf,
-            }
+    # Regla principal: solo si action buy/sell y confianza suficiente
+    if sym and action in ("buy", "sell") and conf >= min_conf:
+        return {"symbol": sym, "side": action, "source": "signals_ai", "confidence": conf, "strategy_code": strategy_code}
 
-    # Si AI no trae una orden stock simple, revisamos si parece "estructura" de opciones.
+    # Si parece opciones/no-stock, lo marcamos como no soportado (NO ejecuta)
     structure = data.get("structure", {}) if isinstance(data.get("structure"), dict) else {}
     kind = str(structure.get("kind", "")).lower().strip()
     legs = structure.get("legs", []) if isinstance(structure.get("legs"), list) else []
 
-    if (kind not in ("", "none")) or legs:
+    if (kind not in ("", "none")) or (len(legs) > 0):
         return {
             "status": "not_supported",
             "source": "signals_ai",
             "confidence": conf,
             "kind": kind or "unknown",
             "reason": "ai_signal_looks_like_options_or_non_stock_structure",
+            "strategy_code": strategy_code,
+            "action": action or "wait",
+            "symbol": sym or None,
         }
 
+    # No trade
     return None
 
 
 def _cooldown_allows(symbol: str, side: str) -> Tuple[bool, str]:
-    """
-    Evita repetir órdenes iguales dentro del cooldown configurado (default 15 min).
-    """
     now = datetime.utcnow()
     last_ts = _LAST_ENTRY.get("ts")
     last_sym = _LAST_ENTRY.get("symbol")
@@ -424,14 +382,6 @@ def _set_last_entry(symbol: str, side: str) -> None:
 
 @router.get("/tick")
 def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
-    """
-    EJECUCIÓN / GESTIÓN (solo en auto):
-    - close por hora / P&L / tp/sl
-    - pending trades ejecuta /trade SOLO si auto
-    - AUTO ENTRY: evalúa /signals/ai (multi-símbolo) -> si da orden stock con conf alta ejecuta;
-                 si no, fallback /recommend
-    Protegido por X-BDV-SECRET si BDV_AGENT_SECRET está definido.
-    """
     _require_agent_secret(x_bdv_secret)
 
     inside, rth_reason = _is_inside_rth()
@@ -445,18 +395,16 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
     trades_today = int(config.get("trades_today", 0) or 0)
 
     if exec_mode != "auto":
-        return _with_build_id(
-            {
-                "status": "skipped",
-                "reason": f"execution_mode='{exec_mode}' (no es 'auto')",
-                "config": {
-                    "execution_mode": exec_mode,
-                    "risk_mode": risk_mode,
-                    "max_trades_per_day": max_trades_per_day,
-                    "trades_today": trades_today,
-                },
-            }
-        )
+        return _with_build_id({
+            "status": "skipped",
+            "reason": f"execution_mode='{exec_mode}' (no es 'auto')",
+            "config": {
+                "execution_mode": exec_mode,
+                "risk_mode": risk_mode,
+                "max_trades_per_day": max_trades_per_day,
+                "trades_today": trades_today,
+            },
+        })
 
     account, positions = get_account_and_positions()
     equity = float(account.get("equity", 0.0))
@@ -508,7 +456,6 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
         symbol = pos.get("symbol")
         if not symbol:
             continue
-
         try:
             plpc = float(pos.get("unrealized_plpc", 0.0))
         except (TypeError, ValueError):
@@ -537,21 +484,36 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
         actions["auto_entry"] = {"status": "skipped", "reason": "max_trades_per_day_reached"}
         return _with_build_id({"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "positions_count": 0, "actions": actions})
 
-    # 5.A) Intento con /signals/ai (prioridad 1) evaluando varios símbolos
+    # 5.A) /signals/ai primero
     ai_min_conf = float(os.getenv("AI_MIN_CONFIDENCE", "0.6"))
     ai_checked: List[Dict[str, Any]] = []
     ai_pick: Optional[Dict[str, Any]] = None
 
     for sym in _ai_symbols():
         ai_payload = _get_signals_ai(sym)
-        ai_checked.append({"symbol": sym, "ai": ai_payload})
+
+        # Log mínimo resumido (sin llenar de basura)
+        d = ai_payload.get("data", ai_payload) if isinstance(ai_payload, dict) else {}
+        ai_checked.append({
+            "symbol": sym,
+            "strategy_code": d.get("strategy_code") if isinstance(d, dict) else None,
+            "action": d.get("action") if isinstance(d, dict) else None,
+            "confidence": d.get("confidence") if isinstance(d, dict) else None,
+            "params_echo": d.get("params_echo") if isinstance(d, dict) else None,
+            "status": ai_payload.get("status") if isinstance(ai_payload, dict) else None,
+        })
+
         pick = _pick_trade_from_signals_ai(ai_payload, min_conf=ai_min_conf)
 
-        # si detecta "not_supported" (parece opciones), seguimos al siguiente símbolo
+        # not_supported => sigue
         if isinstance(pick, dict) and pick.get("status") == "not_supported":
             continue
 
-        # si da orden stock, la tomamos
+        # library missing => NO ejecuta, pero lo registramos y seguimos al siguiente símbolo
+        if isinstance(pick, dict) and pick.get("status") == "skipped" and pick.get("reason") == "strategy_library_missing_for_returned_strategy_code":
+            continue
+
+        # orden stock ejecutable
         if isinstance(pick, dict) and pick.get("symbol") and pick.get("side") and pick.get("source") == "signals_ai":
             ai_pick = pick
             break
@@ -559,13 +521,7 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
     if ai_pick:
         ok_cd, cd_reason = _cooldown_allows(ai_pick["symbol"], ai_pick["side"])
         if not ok_cd:
-            actions["auto_entry"] = {
-                "status": "skipped",
-                "reason": cd_reason,
-                "picked": ai_pick,
-                "source": "signals_ai",
-                "signals_ai_checked": ai_checked,
-            }
+            actions["auto_entry"] = {"status": "skipped", "reason": cd_reason, "picked": ai_pick, "source": "signals_ai", "signals_ai_checked": ai_checked}
             return _with_build_id({"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "positions_count": 0, "actions": actions})
 
         qty = 1
@@ -573,39 +529,20 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
         if out.get("status") == "ok":
             _set_last_entry(ai_pick["symbol"], ai_pick["side"])
 
-        actions["auto_entry"] = {
-            "status": "attempted",
-            "source": "signals_ai",
-            "picked": ai_pick,
-            "qty": qty,
-            "trade_result": out,
-            "signals_ai_checked": ai_checked,
-        }
+        actions["auto_entry"] = {"status": "attempted", "source": "signals_ai", "picked": ai_pick, "qty": qty, "trade_result": out, "signals_ai_checked": ai_checked}
         return _with_build_id({"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "positions_count": 0, "actions": actions})
 
-    # 5.B) Fallback a /recommend (prioridad 2)
+    # 5.B) fallback recommend
     rec = _get_recommendation()
     pick = _pick_trade_from_recommend(rec if isinstance(rec, dict) else {})
 
     if not pick:
-        actions["auto_entry"] = {
-            "status": "skipped",
-            "reason": "no_trade_signal",
-            "recommend": rec,
-            "signals_ai_checked": ai_checked,
-        }
+        actions["auto_entry"] = {"status": "skipped", "reason": "no_trade_signal", "recommend": rec, "signals_ai_checked": ai_checked}
         return _with_build_id({"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "positions_count": 0, "actions": actions})
 
     ok_cd, cd_reason = _cooldown_allows(pick["symbol"], pick["side"])
     if not ok_cd:
-        actions["auto_entry"] = {
-            "status": "skipped",
-            "reason": cd_reason,
-            "picked": pick,
-            "source": "recommend",
-            "recommend": rec,
-            "signals_ai_checked": ai_checked,
-        }
+        actions["auto_entry"] = {"status": "skipped", "reason": cd_reason, "picked": pick, "source": "recommend", "recommend": rec, "signals_ai_checked": ai_checked}
         return _with_build_id({"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "positions_count": 0, "actions": actions})
 
     qty = 1
@@ -613,14 +550,5 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
     if out.get("status") == "ok":
         _set_last_entry(pick["symbol"], pick["side"])
 
-    actions["auto_entry"] = {
-        "status": "attempted",
-        "source": "recommend",
-        "picked": pick,
-        "qty": qty,
-        "trade_result": out,
-        "recommend": rec,
-        "signals_ai_checked": ai_checked,
-    }
-
+    actions["auto_entry"] = {"status": "attempted", "source": "recommend", "picked": pick, "qty": qty, "trade_result": out, "recommend": rec, "signals_ai_checked": ai_checked}
     return _with_build_id({"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "positions_count": 0, "actions": actions})
