@@ -1,11 +1,13 @@
 # routes/signals_ai.py
+
 from enum import Enum
-from typing import Optional, List
+from typing import Optional, List, Any, Dict, Union
 
 from fastapi import APIRouter, Query
 from pydantic import BaseModel, Field
 
 router = APIRouter(prefix="/signals", tags=["signals_ai"])
+
 
 # =====================================================
 # ENUMS
@@ -33,6 +35,16 @@ class Direction(str, Enum):
     call = "call"
     put = "put"
     none = "none"
+
+
+class Action(str, Enum):
+    """
+    Acción resumida para consumo de otros módulos.
+    Por defecto será "wait" para evitar overtrading.
+    """
+    buy = "buy"
+    sell = "sell"
+    wait = "wait"
 
 
 # =====================================================
@@ -95,14 +107,24 @@ class OptionSignal(BaseModel):
     risk: RiskPlan
     notes: List[str] = Field(default_factory=list)
 
+    # ✅ Campo resumido para facilitar consumo (monitor/logs/UI)
+    # Por defecto: wait (no-trade)
+    action: Action = Field(Action.wait, description="Resumen: buy/sell/wait (por defecto wait).")
+
+    # ✅ Meta útil de depuración (qué params llegaron al endpoint)
+    params_echo: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Echo de params utilizados (para auditoría)."
+    )
+
 
 # =====================================================
 # LIBRERÍA DE ESTRATEGIAS PROFESIONALES
 # =====================================================
 
-STRATEGY_LIBRARY = {
-    # (... tu librería completa intacta ...)
-
+STRATEGY_LIBRARY: Dict[str, Dict[str, Any]] = {
+    # ✅ Ejemplo mínimo. Mantén tu librería completa aquí (intacta),
+    # solo asegúrate que 'structure.legs' sea lista de strings.
     "no_trade": {
         "human_label": "Sin operación – contexto no favorable",
         "time_frame": "5m",
@@ -128,6 +150,69 @@ STRATEGY_LIBRARY = {
 
 
 # =====================================================
+# HELPERS (NORMALIZACIÓN)
+# =====================================================
+
+def _normalize_symbol(symbol: str) -> str:
+    s = (symbol or "").strip().upper()
+    if s not in ("QQQ", "SPY", "NVDA"):
+        # fallback seguro
+        return "QQQ"
+    return s
+
+
+def _normalize_legs(value: Union[List[str], str, int, None]) -> List[str]:
+    """
+    En tu screenshot aparecía legs: 1 (int). Eso NO debe pasar.
+    Aquí normalizamos a List[str] siempre.
+    """
+    if value is None:
+        return []
+    if isinstance(value, list):
+        # filtra a strings
+        out: List[str] = []
+        for x in value:
+            if x is None:
+                continue
+            out.append(str(x))
+        return out
+    if isinstance(value, (str, int, float)):
+        # si venía un número/string raro, no lo usamos como “legs”
+        return []
+    return []
+
+
+def _infer_action(strategy_code: str, bias: Bias, confidence: float, kind: StructureKind) -> Action:
+    """
+    IMPORTANTÍSIMO:
+    - Por defecto NO queremos ejecutar trades por IA.
+    - Así que action = wait salvo que tú habilites explícitamente un modo.
+    """
+    # regla segura: no_trade => wait
+    if strategy_code == "no_trade" or kind == StructureKind.none or confidence <= 0:
+        return Action.wait
+
+    # Por defecto seguimos siendo conservadores: WAIT.
+    # Si luego quieres habilitar BUY/SELL, lo hacemos con una ENV (te lo dejo listo):
+    import os
+    enable_stock_action = os.getenv("AI_ENABLE_STOCK_ACTION", "false").lower() in ("1", "true", "yes")
+    min_conf = float(os.getenv("AI_MIN_CONFIDENCE", "0.75"))
+
+    if not enable_stock_action:
+        return Action.wait
+
+    if confidence < min_conf:
+        return Action.wait
+
+    # Mapeo simple (solo si lo habilitas):
+    if bias == Bias.bullish:
+        return Action.buy
+    if bias == Bias.bearish:
+        return Action.sell
+    return Action.wait
+
+
+# =====================================================
 # LÓGICA DE ELECCIÓN DE ESTRATEGIA
 # =====================================================
 
@@ -141,10 +226,11 @@ def choose_strategy_code(
     """
     Selecciona un strategy_code profesional según el contexto.
     """
-    # (contenido intacto)
+    # 🔒 guardrail: si no hay fuerza de tendencia, no trade
     if trend_strength <= 1:
         return "no_trade"
 
+    # Ejemplos (ajusta según tu librería real):
     if near_extreme and bias == "bullish" and prefer_spreads:
         return "premium_put_credit_spread"
 
@@ -160,25 +246,43 @@ def choose_strategy_code(
     return "no_trade"
 
 
-def build_ai_signal_response(symbol: str, bias: Bias, strategy_code: str) -> OptionSignal:
+def build_ai_signal_response(
+    symbol: str,
+    bias: Bias,
+    strategy_code: str,
+    params_echo: Optional[Dict[str, Any]] = None
+) -> OptionSignal:
     """
     Construye el objeto OptionSignal final a partir de STRATEGY_LIBRARY.
     """
     strategy = STRATEGY_LIBRARY.get(strategy_code, STRATEGY_LIBRARY["no_trade"])
 
-    structure = OptionStructure(**strategy["structure"])
-    risk = RiskPlan(**strategy["risk"])
+    # Normaliza legs SIEMPRE a lista de strings
+    struct_dict = dict(strategy.get("structure", {}))
+    struct_dict["legs"] = _normalize_legs(struct_dict.get("legs"))
+
+    # Si kind no existe o es inválido, fuerza none
+    if "kind" not in struct_dict:
+        struct_dict["kind"] = "none"
+
+    structure = OptionStructure(**struct_dict)
+    risk = RiskPlan(**strategy.get("risk", {}))
+
+    confidence = float(strategy.get("confidence", 0.0) or 0.0)
+    action = _infer_action(strategy_code=strategy_code, bias=bias, confidence=confidence, kind=structure.kind)
 
     return OptionSignal(
         symbol=symbol,
         strategy_code=strategy_code,
-        human_label=strategy["human_label"],
-        time_frame=strategy["time_frame"],
+        human_label=strategy.get("human_label", "Señal IA"),
+        time_frame=strategy.get("time_frame", "5m"),
         bias=bias,
-        confidence=strategy["confidence"],
+        confidence=confidence,
         structure=structure,
         risk=risk,
-        notes=strategy["notes"],
+        notes=list(strategy.get("notes", [])) if isinstance(strategy.get("notes"), list) else [],
+        action=action,
+        params_echo=params_echo,
     )
 
 
@@ -188,8 +292,15 @@ def build_ai_signal_response(symbol: str, bias: Bias, strategy_code: str) -> Opt
 
 @router.get("/ai", response_model=OptionSignal)
 def generate_ai_signal(
-    symbol: str = Query(..., regex="^(QQQ|SPY|NVDA)$", description="Símbolo: QQQ, SPY o NVDA."),
-    bias: Bias = Query(..., description="Sesgo actual: bullish, bearish o neutral."),
+    # ✅ YA NO es obligatorio: así no hay 422 si alguien llama “pelado”
+    symbol: str = Query(
+        "QQQ",
+        pattern="^(QQQ|SPY|NVDA)$",
+        description="Símbolo: QQQ, SPY o NVDA."
+    ),
+    # ✅ Default para evitar 422
+    bias: Bias = Query(Bias.bullish, description="Sesgo actual: bullish, bearish o neutral."),
+    # ✅ Default ya existe; mantenemos rango
     trend_strength: int = Query(
         1,
         ge=1,
@@ -211,27 +322,52 @@ def generate_ai_signal(
 ):
     """
     Genera una señal profesional de opciones para QQQ/SPY/NVDA.
+    Por defecto NO recomienda ejecutar trades automáticos (action='wait'),
+    a menos que habilites AI_ENABLE_STOCK_ACTION=true y pase el umbral.
     """
 
+    sym = _normalize_symbol(symbol)
+
     strategy_code = choose_strategy_code(
-        symbol=symbol,
+        symbol=sym,
         bias=bias.value,
         trend_strength=trend_strength,
         near_extreme=near_extreme,
         prefer_spreads=prefer_spreads,
     )
 
-    signal = build_ai_signal_response(symbol=symbol, bias=bias, strategy_code=strategy_code)
+    params_echo = {
+        "symbol": sym,
+        "bias": bias.value,
+        "trend_strength": trend_strength,
+        "near_extreme": near_extreme,
+        "extreme_side": extreme_side.value if extreme_side else None,
+        "prefer_spreads": prefer_spreads,
+    }
 
-    # 🔔 Notificación Telegram añadida
+    signal = build_ai_signal_response(
+        symbol=sym,
+        bias=bias,
+        strategy_code=strategy_code,
+        params_echo=params_echo
+    )
+
+    # 🔔 Notificación Telegram (defensivo con None)
     try:
         from routes.telegram_notify import send_alert
+
+        tp = signal.risk.take_profit_pct
+        sl = signal.risk.stop_loss_pct
+
         send_alert("signal", {
             "symbol": signal.symbol,
             "bias": signal.bias.value,
+            "action": signal.action.value,
+            "strategy_code": signal.strategy_code,
             "suggestion": signal.human_label,
-            "target": f"{signal.risk.take_profit_pct}%",
-            "stop": f"-{signal.risk.stop_loss_pct}%",
+            "confidence": signal.confidence,
+            "target": f"{tp}%" if tp is not None else "n/a",
+            "stop": f"-{sl}%" if sl is not None else "n/a",
             "note": signal.notes[0] if signal.notes else ""
         })
     except Exception as e:
