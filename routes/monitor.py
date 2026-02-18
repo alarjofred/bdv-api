@@ -388,6 +388,7 @@ def _pick_trade_from_signals_ai(ai_payload: Dict[str, Any], min_conf: float) -> 
     return None
 
 
+# ✅ ✅ ✅ FIX AQUI: kind="none" NO debe marcarse como opciones
 def _summarize_ai(ai_payload: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(ai_payload, dict):
         return {"status": "bad_ai_payload"}
@@ -397,8 +398,11 @@ def _summarize_ai(ai_payload: Dict[str, Any]) -> Dict[str, Any]:
         return {"status": ai_payload.get("status", "unknown")}
 
     structure = data.get("structure", {}) if isinstance(data.get("structure"), dict) else {}
+    kind = str(structure.get("kind", "")).lower().strip()
     legs = structure.get("legs", [])
     legs_is_nonempty = isinstance(legs, list) and len(legs) > 0
+
+    looks_like_options = legs_is_nonempty or (kind not in ("", "none"))
 
     return {
         "status": ai_payload.get("status", "ok"),
@@ -406,7 +410,7 @@ def _summarize_ai(ai_payload: Dict[str, Any]) -> Dict[str, Any]:
         "action": (data.get("action") or data.get("side") or data.get("suggestion")),
         "confidence": data.get("confidence"),
         "trend_strength_used": AI_TREND_MIN,
-        "looks_like_options": bool(legs_is_nonempty or str(structure.get("kind", "")).strip()),
+        "looks_like_options": bool(looks_like_options),
     }
 
 
