@@ -116,7 +116,7 @@ STRATEGY_LIBRARY: Dict[str, Dict[str, Any]] = {
             "delta_hint": None,
         },
         "risk": {
-            "stop_loss_pct": 0.35,     # interpretado por tu executor como referencia
+            "stop_loss_pct": 0.35,     # referencia informativa
             "take_profit_pct": 0.60,
             "trailing_from_pct": 0.35,
             "trailing_stop_pct": 0.25,
@@ -220,7 +220,6 @@ def _normalize_legs(value: Any) -> List[str]:
                 continue
             out.append(str(x))
         return out
-    # todo lo demás: no lo aceptamos como legs
     return []
 
 
@@ -262,24 +261,22 @@ def _infer_action(strategy_code: str, bias: Bias, confidence: float, kind: Struc
 
 def choose_strategy_code(symbol: str, bias: str, trend_strength: int, near_extreme: bool, prefer_spreads: bool) -> str:
     """
-    STOCK MODE:
-    - Devuelve SOLO estrategias con structure.kind="none" (para que monitor.py no las marque como opciones)
-    - Usa trend_strength como gatillo:
-        1 => no_trade
-        2 => scalp_stock_momo_*
-        3 => trend_stock_*
+    STOCK MODE (B):
+    - Solo devuelve strategies que YA existen en STRATEGY_LIBRARY.
+    - Gatilho “más fácil”:
+        trend_strength <= 1 => no_trade
+        trend_strength >= 2 => trend_* (si bias bullish/bearish)
+    - Neutral => no_trade
     """
     if trend_strength <= 1:
         return "no_trade"
 
-    # si está en extremos, podrías reforzar el trend. Aquí lo dejamos simple.
     if bias == "bullish":
-        return "trend_stock_buy" if trend_strength >= 3 else "scalp_stock_momo_buy"
+        return "trend_stock_buy" if trend_strength >= 2 else "scalp_stock_momo_buy"
 
     if bias == "bearish":
-        return "trend_stock_sell" if trend_strength >= 3 else "scalp_stock_momo_sell"
+        return "trend_stock_sell" if trend_strength >= 2 else "scalp_stock_momo_sell"
 
-    # neutral: solo trade si trend_strength=3 (opcional). Por ahora, conservador:
     return "no_trade"
 
 
