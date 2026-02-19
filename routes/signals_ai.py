@@ -76,11 +76,11 @@ class OptionSignal(BaseModel):
 
 
 # =====================================================
-# LIBRERÍA DE ESTRATEGIAS
+# LIBRERÍA DE ESTRATEGIAS (STOCK MODE)
 # =====================================================
 
 STRATEGY_LIBRARY: Dict[str, Dict[str, Any]] = {
-    # Mantén tu librería completa aquí.
+    # ---------- SAFE DEFAULT ----------
     "no_trade": {
         "human_label": "Sin operación – contexto no favorable",
         "time_frame": "5m",
@@ -100,6 +100,96 @@ STRATEGY_LIBRARY: Dict[str, Dict[str, Any]] = {
         },
         "notes": [
             "No se detectó una ventaja clara de trading en este momento. Mantenerse fuera del mercado."
+        ],
+    },
+
+    # ---------- STOCK: TREND (más fuerte) ----------
+    "trend_stock_buy": {
+        "human_label": "Stock Trend Buy – momentum confirmado",
+        "time_frame": "5m",
+        "confidence": 0.74,  # ajustable
+        "structure": {
+            "kind": "none",
+            "direction": "none",
+            "legs": [],
+            "days_to_expiry": None,
+            "delta_hint": None,
+        },
+        "risk": {
+            "stop_loss_pct": 0.35,     # interpretado por tu executor como referencia
+            "take_profit_pct": 0.60,
+            "trailing_from_pct": 0.35,
+            "trailing_stop_pct": 0.25,
+        },
+        "notes": [
+            "Entrada de acción (stock) por tendencia fuerte. Evita overtrade con umbral de confianza + cooldown."
+        ],
+    },
+
+    "trend_stock_sell": {
+        "human_label": "Stock Trend Sell – presión bajista confirmada",
+        "time_frame": "5m",
+        "confidence": 0.74,  # ajustable
+        "structure": {
+            "kind": "none",
+            "direction": "none",
+            "legs": [],
+            "days_to_expiry": None,
+            "delta_hint": None,
+        },
+        "risk": {
+            "stop_loss_pct": 0.35,
+            "take_profit_pct": 0.60,
+            "trailing_from_pct": 0.35,
+            "trailing_stop_pct": 0.25,
+        },
+        "notes": [
+            "Entrada short/SELL en acción por tendencia fuerte. (Si tu broker no permite short, se bloqueará en /trade)."
+        ],
+    },
+
+    # ---------- STOCK: SCALP/MOMO (más frecuente, menor conf) ----------
+    "scalp_stock_momo_buy": {
+        "human_label": "Stock Scalp Buy – impulso corto plazo",
+        "time_frame": "5m",
+        "confidence": 0.66,  # más permisivo
+        "structure": {
+            "kind": "none",
+            "direction": "none",
+            "legs": [],
+            "days_to_expiry": None,
+            "delta_hint": None,
+        },
+        "risk": {
+            "stop_loss_pct": 0.25,
+            "take_profit_pct": 0.45,
+            "trailing_from_pct": 0.25,
+            "trailing_stop_pct": 0.18,
+        },
+        "notes": [
+            "Señal más ligera para aumentar frecuencia. Ajusta AI_MIN_CONFIDENCE si quieres más entradas."
+        ],
+    },
+
+    "scalp_stock_momo_sell": {
+        "human_label": "Stock Scalp Sell – impulso bajista corto plazo",
+        "time_frame": "5m",
+        "confidence": 0.66,
+        "structure": {
+            "kind": "none",
+            "direction": "none",
+            "legs": [],
+            "days_to_expiry": None,
+            "delta_hint": None,
+        },
+        "risk": {
+            "stop_loss_pct": 0.25,
+            "take_profit_pct": 0.45,
+            "trailing_from_pct": 0.25,
+            "trailing_stop_pct": 0.18,
+        },
+        "notes": [
+            "Señal ligera para SELL/short. (Si no hay short, /trade puede fallar)."
         ],
     },
 }
@@ -167,25 +257,29 @@ def _infer_action(strategy_code: str, bias: Bias, confidence: float, kind: Struc
 
 
 # =====================================================
-# LÓGICA DE ELECCIÓN DE ESTRATEGIA
+# LÓGICA DE ELECCIÓN DE ESTRATEGIA (STOCK MODE)
 # =====================================================
 
 def choose_strategy_code(symbol: str, bias: str, trend_strength: int, near_extreme: bool, prefer_spreads: bool) -> str:
+    """
+    STOCK MODE:
+    - Devuelve SOLO estrategias con structure.kind="none" (para que monitor.py no las marque como opciones)
+    - Usa trend_strength como gatillo:
+        1 => no_trade
+        2 => scalp_stock_momo_*
+        3 => trend_stock_*
+    """
     if trend_strength <= 1:
         return "no_trade"
 
-    if near_extreme and bias == "bullish" and prefer_spreads:
-        return "premium_put_credit_spread"
-
+    # si está en extremos, podrías reforzar el trend. Aquí lo dejamos simple.
     if bias == "bullish":
-        return "intraday_call_spread" if prefer_spreads else "scalp_call_momo"
+        return "trend_stock_buy" if trend_strength >= 3 else "scalp_stock_momo_buy"
 
     if bias == "bearish":
-        return "intraday_put_spread" if prefer_spreads else "scalp_put_momo"
+        return "trend_stock_sell" if trend_strength >= 3 else "scalp_stock_momo_sell"
 
-    if bias == "neutral" and trend_strength >= 3:
-        return "swing_call_trend"
-
+    # neutral: solo trade si trend_strength=3 (opcional). Por ahora, conservador:
     return "no_trade"
 
 
