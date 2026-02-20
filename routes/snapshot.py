@@ -1,18 +1,22 @@
-from fastapi import APIRouter, HTTPException
-import os
-import requests
+from fastapi import APIRouter, HTTPException, Query
+import os, requests
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta, timezone
 
 router = APIRouter(prefix="/snapshot", tags=["snapshot"])
 
-# DATA_URL base SIN /v2
+# IMPORTANTÍSIMO:
+# - DATA_URL NO debe incluir /v2
+# - TRADING_URL no se usa aquí
 DATA_URL = os.getenv("APCA_DATA_URL", "https://data.alpaca.markets").rstrip("/")
 API_KEY = os.getenv("APCA_API_KEY_ID")
 API_SECRET = os.getenv("APCA_API_SECRET_KEY")
 
+# Para cuentas sin SIP, forzamos IEX por defecto (puedes override por query)
+DEFAULT_FEED = os.getenv("APCA_DATA_FEED", "iex").strip().lower()  # iex | sip (si tu plan lo permite)
 
-def _headers() -> Dict[str, str]:
+
+def _headers():
     if not API_KEY or not API_SECRET:
         raise HTTPException(status_code=500, detail="Missing Alpaca keys (APCA_API_KEY_ID / APCA_API_SECRET_KEY)")
     return {
@@ -31,7 +35,7 @@ def _ema(values: List[float], period: int) -> float:
     ema = values[0]
     for v in values[1:]:
         ema = v * k + ema * (1 - k)
-    return float(ema)
+    return ema
 
 
 def _rsi(values: List[float], period: int = 14) -> float:
@@ -69,35 +73,52 @@ def _infer_bias_and_strength(price: float, ema_fast: float, ema_slow: float, rsi
     if bias == "neutral":
         strength = 1
 
-    return {"bias_inferred": bias, "trend_strength": strength, "sep": float(sep)}
+    return {"bias_inferred": bias, "trend_strength": strength, "sep": sep}
 
 
-def _fetch_bars_multi(
-    syms: List[str],
-    timeframe: str,
-    limit: int,
-    hours_back: int,
-    feed: Optional[str] = None,
-) -> Dict[str, Any]:
-    # endpoint multi-symbol
+@router.get("/indicators")
+def indicators(
+    # Acepta ambos para que Swagger no te “engaňe”:
+    symbol: Optional[str] = Query(default=None, description="Símbolo único (alternativa a symbols)"),
+    symbols: str = Query(default="QQQ,SPY,NVDA", description="Lista CSV de símbolos"),
+    timeframe: str = Query(default="5Min", description="Ej: 1Min, 5Min, 15Min, 1Hour, 1Day"),
+    limit: int = Query(default=200, ge=10, le=10000),
+    lookback_hours: int = Query(default=48, ge=6, le=240),
+    feed: Optional[str] = Query(default=None, description="iex o sip (si tu plan permite sip)"),
+):
+    # Normaliza símbolos
+    if symbol:
+        syms = [symbol.strip().upper()]
+    else:
+        syms = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+        if not syms:
+            syms = ["QQQ"]
+
+    # Rango: ampliado por defecto para evitar insufficient_data
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(hours=int(lookback_hours))
+
+    # Endpoint correcto (SIN duplicar /v2)
     url = f"{DATA_URL}/v2/stocks/bars"
 
-    end = datetime.now(timezone.utc)
-    start = end - timedelta(hours=hours_back)
+    # Feed seguro para planes sin SIP
+    use_feed = (feed or DEFAULT_FEED or "iex").strip().lower()
+    if use_feed not in ("iex", "sip"):
+        use_feed = "iex"
 
-    params: Dict[str, Any] = {
+    params = {
         "symbols": ",".join(syms),
         "timeframe": timeframe,
         "start": start.isoformat().replace("+00:00", "Z"),
         "end": end.isoformat().replace("+00:00", "Z"),
         "limit": str(limit),
         "adjustment": "raw",
+        "feed": use_feed,  # <-- clave para evitar 403 SIP
     }
-    if feed:
-        params["feed"] = feed  # clave para planes sin SIP
 
     r = requests.get(url, headers=_headers(), params=params, timeout=15)
     if r.status_code != 200:
+        # Devuelve detalles útiles (tu screenshot lo muestra así)
         raise HTTPException(
             status_code=r.status_code,
             detail={
@@ -108,93 +129,43 @@ def _fetch_bars_multi(
                 "params": params,
             },
         )
-    return r.json()
 
-
-def _compute_indicators_from_payload(syms: List[str], payload: Dict[str, Any], min_needed: int = 20) -> Dict[str, Any]:
+    payload = r.json() if r.text else {}
     bars = payload.get("bars", {}) if isinstance(payload, dict) else {}
+
     out: Dict[str, Any] = {}
-
     for sym in syms:
-        rows = bars.get(sym, []) if isinstance(bars, dict) else []
-        closes = [float(x["c"]) for x in rows if isinstance(x, dict) and "c" in x]
+        rows = bars.get(sym, []) or []
+        closes = [float(x.get("c")) for x in rows if x.get("c") is not None]
 
-        if len(closes) < min_needed:
+        if len(closes) < 20:
             out[sym] = {"status": "insufficient_data", "count": len(closes)}
             continue
 
-        price = float(closes[-1])
-        ema_fast = _ema(closes[-30:], 9)
-        ema_slow = _ema(closes[-60:], 21)
+        price = closes[-1]
+        ema_fast = _ema(closes[-60:], 9)
+        ema_slow = _ema(closes[-120:], 21)
         rsi_val = _rsi(closes, 14)
         inf = _infer_bias_and_strength(price, ema_fast, ema_slow, rsi_val)
 
         out[sym] = {
             "status": "ok",
             "price": price,
-            "ema_fast": float(ema_fast),
-            "ema_slow": float(ema_slow),
-            "rsi": float(rsi_val),
+            "ema_fast": ema_fast,
+            "ema_slow": ema_slow,
+            "rsi": rsi_val,
             **inf,
         }
-
-    return out
-
-
-@router.get("/indicators")
-def indicators(
-    # Swagger a veces envía symbol=QQQ, así que soportamos ambos
-    symbol: Optional[str] = None,
-    symbols: str = "QQQ,SPY,NVDA",
-    timeframe: str = "5Min",
-    limit: int = 60,
-):
-    # Normaliza símbolos
-    if symbol and str(symbol).strip():
-        syms = [str(symbol).strip().upper()]
-    else:
-        syms = [s.strip().upper() for s in symbols.split(",") if s.strip()]
-        if not syms:
-            syms = ["QQQ"]
-
-    # 1) Intento intradía con IEX (evita error SIP)
-    intraday_payload = _fetch_bars_multi(
-        syms=syms,
-        timeframe=timeframe,
-        limit=limit,
-        hours_back=8,
-        feed="iex",
-    )
-    out = _compute_indicators_from_payload(syms, intraday_payload, min_needed=20)
-
-    # 2) Fallback: si un símbolo no tiene data suficiente, usamos 1Day (casi siempre permitido)
-    need_fallback = [s for s in syms if out.get(s, {}).get("status") != "ok"]
-    fallback_meta: Dict[str, Any] = {}
-
-    if need_fallback:
-        daily_payload = _fetch_bars_multi(
-            syms=need_fallback,
-            timeframe="1Day",
-            limit=max(60, limit),
-            hours_back=24 * 120,  # 120 días
-            feed=None,  # daily suele funcionar sin feed
-        )
-        daily_out = _compute_indicators_from_payload(need_fallback, daily_payload, min_needed=20)
-
-        for s in need_fallback:
-            if daily_out.get(s, {}).get("status") == "ok":
-                out[s] = daily_out[s]
-                fallback_meta[s] = {"used_fallback": True, "fallback_timeframe": "1Day"}
 
     return {
         "status": "ok",
         "data": out,
         "meta": {
             "data_url": DATA_URL,
-            "intraday_endpoint": "/v2/stocks/bars",
-            "intraday_feed": "iex",
-            "intraday_timeframe": timeframe,
-            "intraday_limit": limit,
-            "fallback": fallback_meta,
+            "endpoint": "/v2/stocks/bars",
+            "feed": use_feed,
+            "timeframe": timeframe,
+            "limit": limit,
+            "lookback_hours": lookback_hours,
         },
     }
