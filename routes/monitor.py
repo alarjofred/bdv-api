@@ -44,6 +44,17 @@ AUTO_ENTRY_COOLDOWN_SEC = _env_int("AUTO_ENTRY_COOLDOWN_SEC", 1800)  # 30 min
 AI_TREND_MIN = _env_int("AI_TREND_MIN", 2)  # fallback si market_ctx falla
 AI_MIN_CONFIDENCE = _env_float("AI_MIN_CONFIDENCE", 0.75)
 
+# ✅ “Dual support” (Market Context gate)
+MARKET_CTX_ENABLED = str(os.getenv("MARKET_CTX_ENABLED", "true")).strip().lower() in ("1", "true", "yes", "y", "on")
+MARKET_TREND_MIN = _env_int("MARKET_TREND_MIN", 2)  # si trend_strength < esto => no auto-entry
+MARKET_CTX_TIMEFRAME = os.getenv("MARKET_CTX_TIMEFRAME", "5Min").strip()
+MARKET_CTX_LIMIT = _env_int("MARKET_CTX_LIMIT", 200)
+MARKET_CTX_LOOKBACK_HOURS = _env_int("MARKET_CTX_LOOKBACK_HOURS", 48)
+MARKET_CTX_FEED = os.getenv("APCA_DATA_FEED", "").strip().lower()  # iex/sip (si existe). si vacio, snapshot.py decide default
+
+# ✅ Preparado para Paper/Live “on demand”
+DEFAULT_ALPACA_MODE = os.getenv("ALPACA_MODE", "paper").strip().lower()  # paper | live
+
 
 def _bool_env(name: str, default: bool = False) -> bool:
     raw = os.getenv(name, "true" if default else "false")
@@ -104,6 +115,22 @@ def get_config_status() -> Dict[str, Any]:
         return data.get("data", data) if isinstance(data, dict) else {}
     except Exception:
         return {}
+
+
+def _get_alpaca_mode_from_config(config: Dict[str, Any]) -> str:
+    """
+    Preparado para dual paper/live.
+    Si luego agregas esto al panel (/config), monitor lo respeta sin redeploy.
+
+    Orden:
+      1) config["alpaca_mode"] si existe (paper/live)
+      2) env ALPACA_MODE
+    """
+    mode = str(config.get("alpaca_mode", "") or "").strip().lower()
+    if mode in ("paper", "live"):
+        return mode
+    mode = DEFAULT_ALPACA_MODE
+    return mode if mode in ("paper", "live") else "paper"
 
 
 def get_account_and_positions() -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
@@ -175,9 +202,10 @@ def close_symbol_via_api(symbol: str) -> Dict[str, Any]:
     raise HTTPException(status_code=resp.status_code, detail=f"Error /alpaca/close/{symbol}: {resp.text}")
 
 
-def _execute_trade_via_http(symbol: str, side: str, qty: int) -> Dict[str, Any]:
+def _execute_trade_via_http(symbol: str, side: str, qty: int, alpaca_mode: Optional[str] = None) -> Dict[str, Any]:
     """
     Ejecuta /trade (solo acciones hoy). Retorna respuesta o info de error (sin romper tick).
+    ✅ Preparado para dual paper/live: manda alpaca_mode (paper/live) si está.
     """
     if not API_BASE:
         return {"status": "error", "detail": "API_BASE missing"}
@@ -187,7 +215,11 @@ def _execute_trade_via_http(symbol: str, side: str, qty: int) -> Dict[str, Any]:
     qty = int(qty)
 
     url = f"{API_BASE.rstrip('/')}/trade"
-    payload = {"symbol": symbol, "side": side, "qty": qty}
+    payload: Dict[str, Any] = {"symbol": symbol, "side": side, "qty": qty}
+
+    # No rompe aunque trade.py aún no lo use
+    if alpaca_mode in ("paper", "live"):
+        payload["alpaca_mode"] = alpaca_mode
 
     try:
         r = requests.post(url, headers=_api_headers(), json=payload, timeout=10)
@@ -325,26 +357,67 @@ def _ai_symbols() -> List[str]:
 # ==============================
 # ✅ PASO 2: Market context live
 # ==============================
-def _get_market_context() -> Dict[str, Any]:
+def _get_market_context(symbols: List[str]) -> Dict[str, Any]:
     """
     Llama a /snapshot/indicators para obtener bias_inferred + trend_strength por símbolo.
     """
     if not API_BASE:
         return {}
+
+    params: Dict[str, Any] = {
+        "symbols": ",".join([s.strip().upper() for s in symbols if s.strip()]),
+        "timeframe": MARKET_CTX_TIMEFRAME,
+        "limit": str(MARKET_CTX_LIMIT),
+        "lookback_hours": str(MARKET_CTX_LOOKBACK_HOURS),
+    }
+    # feed opcional (si está configurado). si no, snapshot.py usa su default seguro
+    if MARKET_CTX_FEED in ("iex", "sip"):
+        params["feed"] = MARKET_CTX_FEED
+
     try:
-        r = requests.get(f"{API_BASE}/snapshot/indicators", headers=_api_headers(), timeout=12)
+        r = requests.get(f"{API_BASE}/snapshot/indicators", headers=_api_headers(), params=params, timeout=15)
         if r.status_code != 200:
-            return {"status": "error", "http": r.status_code, "body": r.text}
+            return {"status": "error", "http": r.status_code, "body": r.text, "params": params}
         data = _safe_json(r)
-        return data if isinstance(data, dict) else {"status": "error", "detail": "market_ctx_non_dict"}
+        return data if isinstance(data, dict) else {"status": "error", "detail": "market_ctx_non_dict", "params": params}
     except Exception as e:
-        return {"status": "error", "detail": str(e)}
+        return {"status": "error", "detail": str(e), "params": params}
+
+
+def _market_gate_allows(ctx: Dict[str, Any], side: str) -> Tuple[bool, str]:
+    """
+    Reglas simples (tu “dual support”):
+      - si trend_strength < MARKET_TREND_MIN => NO auto-entry
+      - si bias fuerte contradice el side => NO auto-entry
+    """
+    if not MARKET_CTX_ENABLED:
+        return True, "market_ctx_disabled"
+
+    try:
+        ts = int(ctx.get("trend_strength", 0) or 0)
+    except Exception:
+        ts = 0
+
+    bias = str(ctx.get("bias_inferred", "neutral") or "neutral").strip().lower()
+    if bias not in ("bullish", "bearish", "neutral"):
+        bias = "neutral"
+
+    if ts < MARKET_TREND_MIN:
+        return False, f"market_trend_too_low ts={ts} < {MARKET_TREND_MIN}"
+
+    side = str(side).strip().lower()
+    if side == "buy" and bias == "bearish":
+        return False, f"market_bias_blocks_buy bias={bias} ts={ts}"
+    if side == "sell" and bias == "bullish":
+        return False, f"market_bias_blocks_sell bias={bias} ts={ts}"
+
+    return True, f"market_gate_ok bias={bias} ts={ts}"
 
 
 def _get_signals_ai(symbol: str, bias: str, trend_strength: int) -> Dict[str, Any]:
     """
     Llama a /signals/ai usando bias+trend_strength inferidos del mercado (live).
-    Si market_ctx falla, caller puede pasar fallback neutral/1.
+    Si market_ctx falla, caller puede pasar fallback neutral/AI_TREND_MIN.
     """
     if not API_BASE:
         return {}
@@ -441,7 +514,7 @@ def _summarize_ai(ai_payload: Dict[str, Any]) -> Dict[str, Any]:
         "action": (data.get("action") or data.get("side") or data.get("suggestion")),
         "confidence": data.get("confidence"),
         "looks_like_options": bool(looks_like_options),
-        "params_used": data.get("params_echo") or ai_payload.get("params"),
+        "params_used": ai_payload.get("params"),
     }
 
 
@@ -496,6 +569,7 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
     max_trades_per_day = int(config.get("max_trades_per_day", 1) or 1)
     trades_today = int(config.get("trades_today", 0) or 0)
 
+    alpaca_mode = _get_alpaca_mode_from_config(config)
     recommend_enabled = _bool_env("RECOMMEND_AUTO_ENABLED", False)
 
     actions: Dict[str, Any] = {
@@ -512,6 +586,12 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
             "ai_trend_min_fallback": AI_TREND_MIN,
             "ai_symbols": _ai_symbols(),
             "recommend_auto_enabled": recommend_enabled,
+            "market_ctx_enabled": MARKET_CTX_ENABLED,
+            "market_trend_min": MARKET_TREND_MIN,
+            "market_ctx_timeframe": MARKET_CTX_TIMEFRAME,
+            "market_ctx_limit": MARKET_CTX_LIMIT,
+            "market_ctx_lookback_hours": MARKET_CTX_LOOKBACK_HOURS,
+            "alpaca_mode": alpaca_mode,
         },
         "config_echo": {"execution_mode": exec_mode, "risk_mode": risk_mode},
     }
@@ -604,11 +684,18 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
         return _with_build_id({"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "positions_count": 0, "actions": actions})
 
     # ✅ PASO 2: leer contexto live (bias + trend_strength)
-    market_ctx = _get_market_context()
-    market_data = {}
-    if isinstance(market_ctx, dict):
-        market_data = market_ctx.get("data", {}) if isinstance(market_ctx.get("data"), dict) else {}
-    actions["market_ctx"] = market_data if market_data else market_ctx  # para auditoría
+    market_data: Dict[str, Any] = {}
+    market_ctx_raw: Dict[str, Any] = {}
+
+    syms_for_ctx = _ai_symbols()
+    if MARKET_CTX_ENABLED:
+        market_ctx_raw = _get_market_context(syms_for_ctx)
+        if isinstance(market_ctx_raw, dict):
+            md = market_ctx_raw.get("data")
+            if isinstance(md, dict):
+                market_data = md
+
+    actions["market_ctx"] = market_data if market_data else (market_ctx_raw if market_ctx_raw else {"status": "skipped", "reason": "market_ctx_disabled"})
 
     # Intento con /signals/ai
     ai_checked_summary: List[Dict[str, Any]] = []
@@ -626,7 +713,7 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
         except Exception:
             ts = 1
 
-        # fallback suave si market_ctx no trajo datos
+        # fallback si market_ctx no trajo datos
         if not ctx:
             ts = AI_TREND_MIN if AI_TREND_MIN else 1
 
@@ -639,7 +726,17 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
             continue
 
         if isinstance(pick, dict) and pick.get("symbol") and pick.get("side") and pick.get("source") == "signals_ai":
-            # añade trazabilidad del contexto usado
+            # ✅ GATE FINAL por market_ctx (dual support)
+            if MARKET_CTX_ENABLED:
+                ctx_for_pick = market_data.get(pick["symbol"], {}) if isinstance(market_data, dict) else {}
+                allow_gate, gate_reason = _market_gate_allows(ctx_for_pick if isinstance(ctx_for_pick, dict) else {}, pick["side"])
+                pick["market_gate"] = {"allow": allow_gate, "reason": gate_reason, "ctx": ctx_for_pick}
+                if not allow_gate:
+                    # no tomamos este trade, seguimos buscando otro símbolo
+                    ai_checked_summary[-1]["market_gate_blocked"] = pick["market_gate"]
+                    continue
+
+            # trazabilidad del contexto usado
             pick["bias_used"] = bias
             pick["trend_strength_used"] = ts
             ai_pick = pick
@@ -660,7 +757,7 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
             return _with_build_id({"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "positions_count": 0, "actions": actions})
 
         qty = 1
-        out = _execute_trade_via_http(ai_pick["symbol"], ai_pick["side"], qty)
+        out = _execute_trade_via_http(ai_pick["symbol"], ai_pick["side"], qty, alpaca_mode=alpaca_mode)
         if out.get("status") == "ok":
             _set_last_entry(ai_pick["symbol"], ai_pick["side"])
 
@@ -673,6 +770,7 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
             "cooldown": cd,
             "thresholds": {"ai_min_conf": AI_MIN_CONFIDENCE},
             "signals_ai_checked": ai_checked_summary,
+            "alpaca_mode": alpaca_mode,
         }
         return _with_build_id({"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "positions_count": 0, "actions": actions})
 
@@ -701,6 +799,22 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
         }
         return _with_build_id({"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "positions_count": 0, "actions": actions})
 
+    # ✅ GATE también para recommend si lo habilitas
+    if MARKET_CTX_ENABLED:
+        ctx_for_pick = market_data.get(pick["symbol"], {}) if isinstance(market_data, dict) else {}
+        allow_gate, gate_reason = _market_gate_allows(ctx_for_pick if isinstance(ctx_for_pick, dict) else {}, pick["side"])
+        if not allow_gate:
+            actions["auto_entry"] = {
+                "status": "skipped",
+                "reason": "market_gate",
+                "detail": gate_reason,
+                "picked": pick,
+                "market_ctx_for_pick": ctx_for_pick,
+                "recommend": rec,
+                "signals_ai_checked": ai_checked_summary,
+            }
+            return _with_build_id({"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "positions_count": 0, "actions": actions})
+
     cd = _cooldown_state(pick["symbol"], pick["side"])
     if not cd.get("allow", True):
         actions["auto_entry"] = {
@@ -716,7 +830,7 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
         return _with_build_id({"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "positions_count": 0, "actions": actions})
 
     qty = 1
-    out = _execute_trade_via_http(pick["symbol"], pick["side"], qty)
+    out = _execute_trade_via_http(pick["symbol"], pick["side"], qty, alpaca_mode=alpaca_mode)
     if out.get("status") == "ok":
         _set_last_entry(pick["symbol"], pick["side"])
 
@@ -728,6 +842,7 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
         "trade_result": out,
         "cooldown": cd,
         "recommend": rec,
+        "alpaca_mode": alpaca_mode,
     }
 
     return _with_build_id({"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "positions_count": 0, "actions": actions})
