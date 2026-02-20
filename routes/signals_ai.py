@@ -262,23 +262,18 @@ def _infer_action(strategy_code: str, bias: Bias, confidence: float, kind: Struc
 
 def choose_strategy_code(symbol: str, bias: str, trend_strength: int, near_extreme: bool, prefer_spreads: bool) -> str:
     """
-    STOCK MODE (B):
-    - Solo devuelve strategies que YA existen en STRATEGY_LIBRARY.
-    - Gatilho “más fácil”:
-        trend_strength <= 1 => no_trade
-        trend_strength >= 2 => trend_* (si bias bullish/bearish)
-    - Neutral => no_trade
+    ✅ SUAVIZADO (lo que faltaba):
+    - trend_strength 1 => scalp (entra más rápido)
+    - trend_strength 2-3 => trend (más fuerte)
+    - neutral => no_trade
     """
-    if trend_strength <= 1:
+    if bias == "neutral":
         return "no_trade"
 
-    if bias == "bullish":
-        return "trend_stock_buy" if trend_strength >= 2 else "scalp_stock_momo_buy"
+    if trend_strength <= 1:
+        return "scalp_stock_momo_buy" if bias == "bullish" else "scalp_stock_momo_sell"
 
-    if bias == "bearish":
-        return "trend_stock_sell" if trend_strength >= 2 else "scalp_stock_momo_sell"
-
-    return "no_trade"
+    return "trend_stock_buy" if bias == "bullish" else "trend_stock_sell"
 
 
 def build_ai_signal_response(symbol: str, bias: Bias, strategy_code: str, params_echo: Optional[Dict[str, Any]] = None) -> OptionSignal:
