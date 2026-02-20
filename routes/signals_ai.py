@@ -235,15 +235,15 @@ def _safe_direction(value: Any) -> str:
 
 def _infer_action(strategy_code: str, bias: Bias, confidence: float, kind: StructureKind) -> Action:
     """
-    Anti-overtrading por defecto:
-    - WAIT siempre, salvo que habilites explícitamente con ENV.
+    STOCK MODE: kind será "none", así que NO puede bloquear la acción.
+    Anti-overtrading: solo opera si AI_ENABLE_STOCK_ACTION=true y confidence >= AI_MIN_CONFIDENCE.
     """
-    if strategy_code == "no_trade" or kind == StructureKind.none or confidence <= 0:
+    if strategy_code == "no_trade" or confidence <= 0:
         return Action.wait
 
     import os
     enable_actions = os.getenv("AI_ENABLE_STOCK_ACTION", "false").lower() in ("1", "true", "yes")
-    min_conf = float(os.getenv("AI_MIN_CONFIDENCE", "0.75"))
+    min_conf = float(os.getenv("AI_MIN_CONFIDENCE", "0.65"))
 
     if (not enable_actions) or (confidence < min_conf):
         return Action.wait
@@ -252,6 +252,7 @@ def _infer_action(strategy_code: str, bias: Bias, confidence: float, kind: Struc
         return Action.buy
     if bias == Bias.bearish:
         return Action.sell
+
     return Action.wait
 
 
