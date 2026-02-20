@@ -41,7 +41,7 @@ def _env_float(name: str, default: float) -> float:
 
 
 AUTO_ENTRY_COOLDOWN_SEC = _env_int("AUTO_ENTRY_COOLDOWN_SEC", 1800)  # 30 min
-AI_TREND_MIN = _env_int("AI_TREND_MIN", 2)
+AI_TREND_MIN = _env_int("AI_TREND_MIN", 2)  # fallback si market_ctx falla
 AI_MIN_CONFIDENCE = _env_float("AI_MIN_CONFIDENCE", 0.75)
 
 
@@ -322,17 +322,46 @@ def _ai_symbols() -> List[str]:
     return out or ["QQQ"]
 
 
-def _get_signals_ai(symbol: str) -> Dict[str, Any]:
+# ==============================
+# ✅ PASO 2: Market context live
+# ==============================
+def _get_market_context() -> Dict[str, Any]:
+    """
+    Llama a /snapshot/indicators para obtener bias_inferred + trend_strength por símbolo.
+    """
+    if not API_BASE:
+        return {}
+    try:
+        r = requests.get(f"{API_BASE}/snapshot/indicators", headers=_api_headers(), timeout=12)
+        if r.status_code != 200:
+            return {"status": "error", "http": r.status_code, "body": r.text}
+        data = _safe_json(r)
+        return data if isinstance(data, dict) else {"status": "error", "detail": "market_ctx_non_dict"}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
+
+
+def _get_signals_ai(symbol: str, bias: str, trend_strength: int) -> Dict[str, Any]:
+    """
+    Llama a /signals/ai usando bias+trend_strength inferidos del mercado (live).
+    Si market_ctx falla, caller puede pasar fallback neutral/1.
+    """
     if not API_BASE:
         return {}
 
-    ai_bias = os.getenv("AI_BIAS", "neutral").strip().lower()
-    ai_bias = ai_bias if ai_bias in ("bullish", "bearish", "neutral") else "neutral"
+    bias = (bias or "neutral").strip().lower()
+    if bias not in ("bullish", "bearish", "neutral"):
+        bias = "neutral"
+
+    try:
+        ts = int(trend_strength)
+    except Exception:
+        ts = 1
 
     params = {
         "symbol": str(symbol).strip().upper(),
-        "bias": ai_bias,
-        "trend_strength": AI_TREND_MIN,
+        "bias": bias,
+        "trend_strength": ts,
         "near_extreme": "false",
         "prefer_spreads": "true",
     }
@@ -388,8 +417,10 @@ def _pick_trade_from_signals_ai(ai_payload: Dict[str, Any], min_conf: float) -> 
     return None
 
 
-# ✅ ✅ ✅ FIX AQUI: kind="none" NO debe marcarse como opciones
 def _summarize_ai(ai_payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    ✅ kind="none" NO debe marcarse como opciones
+    """
     if not isinstance(ai_payload, dict):
         return {"status": "bad_ai_payload"}
 
@@ -409,8 +440,8 @@ def _summarize_ai(ai_payload: Dict[str, Any]) -> Dict[str, Any]:
         "symbol": (data.get("symbol") or data.get("ticker")),
         "action": (data.get("action") or data.get("side") or data.get("suggestion")),
         "confidence": data.get("confidence"),
-        "trend_strength_used": AI_TREND_MIN,
         "looks_like_options": bool(looks_like_options),
+        "params_used": data.get("params_echo") or ai_payload.get("params"),
     }
 
 
@@ -478,7 +509,7 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
             "cooldown_sec": AUTO_ENTRY_COOLDOWN_SEC,
             "cooldown_scope": "per_symbol_and_side",
             "ai_min_conf": AI_MIN_CONFIDENCE,
-            "ai_trend_min": AI_TREND_MIN,
+            "ai_trend_min_fallback": AI_TREND_MIN,
             "ai_symbols": _ai_symbols(),
             "recommend_auto_enabled": recommend_enabled,
         },
@@ -572,13 +603,35 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
         actions["auto_entry"] = {"status": "skipped", "reason": "max_trades_per_day_reached", "limits": actions["limits"]}
         return _with_build_id({"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "positions_count": 0, "actions": actions})
 
+    # ✅ PASO 2: leer contexto live (bias + trend_strength)
+    market_ctx = _get_market_context()
+    market_data = {}
+    if isinstance(market_ctx, dict):
+        market_data = market_ctx.get("data", {}) if isinstance(market_ctx.get("data"), dict) else {}
+    actions["market_ctx"] = market_data if market_data else market_ctx  # para auditoría
+
     # Intento con /signals/ai
     ai_checked_summary: List[Dict[str, Any]] = []
     ai_pick: Optional[Dict[str, Any]] = None
 
     for sym in _ai_symbols():
-        ai_payload = _get_signals_ai(sym)
-        ai_checked_summary.append({"symbol": sym, "summary": _summarize_ai(ai_payload)})
+        ctx = market_data.get(sym, {}) if isinstance(market_data, dict) else {}
+
+        bias = str(ctx.get("bias_inferred", "neutral")).strip().lower()
+        if bias not in ("bullish", "bearish", "neutral"):
+            bias = "neutral"
+
+        try:
+            ts = int(ctx.get("trend_strength", 1) or 1)
+        except Exception:
+            ts = 1
+
+        # fallback suave si market_ctx no trajo datos
+        if not ctx:
+            ts = AI_TREND_MIN if AI_TREND_MIN else 1
+
+        ai_payload = _get_signals_ai(sym, bias=bias, trend_strength=ts)
+        ai_checked_summary.append({"symbol": sym, "market_ctx": ctx, "summary": _summarize_ai(ai_payload)})
 
         pick = _pick_trade_from_signals_ai(ai_payload, min_conf=AI_MIN_CONFIDENCE)
 
@@ -586,6 +639,9 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
             continue
 
         if isinstance(pick, dict) and pick.get("symbol") and pick.get("side") and pick.get("source") == "signals_ai":
+            # añade trazabilidad del contexto usado
+            pick["bias_used"] = bias
+            pick["trend_strength_used"] = ts
             ai_pick = pick
             break
 
@@ -598,7 +654,7 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
                 "detail": cd.get("reason"),
                 "cooldown": cd,
                 "picked": ai_pick,
-                "thresholds": {"ai_min_conf": AI_MIN_CONFIDENCE, "ai_trend_min": AI_TREND_MIN},
+                "thresholds": {"ai_min_conf": AI_MIN_CONFIDENCE},
                 "signals_ai_checked": ai_checked_summary,
             }
             return _with_build_id({"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "positions_count": 0, "actions": actions})
@@ -615,7 +671,7 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
             "qty": qty,
             "trade_result": out,
             "cooldown": cd,
-            "thresholds": {"ai_min_conf": AI_MIN_CONFIDENCE, "ai_trend_min": AI_TREND_MIN},
+            "thresholds": {"ai_min_conf": AI_MIN_CONFIDENCE},
             "signals_ai_checked": ai_checked_summary,
         }
         return _with_build_id({"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "positions_count": 0, "actions": actions})
