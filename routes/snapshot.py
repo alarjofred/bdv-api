@@ -6,15 +6,15 @@ from datetime import datetime, timedelta
 
 router = APIRouter(prefix="/snapshot", tags=["snapshot"])
 
-# ------------------------------------------------------
-# Normalización: DATA_URL NO debe terminar en /v2
-# ------------------------------------------------------
+# -----------------------------
+# ENV (NORMALIZACIÓN)
+# -----------------------------
 _raw_data = os.getenv("APCA_DATA_URL", "https://data.alpaca.markets").rstrip("/")
-DATA_URL = _raw_data[:-3] if _raw_data.endswith("/v2") else _raw_data  # quita /v2 si existe
+# Si viene con /v2, lo quitamos para evitar /v2/v2/...
+DATA_URL = _raw_data[:-3] if _raw_data.endswith("/v2") else _raw_data
 
 API_KEY = os.getenv("APCA_API_KEY_ID")
 API_SECRET = os.getenv("APCA_API_SECRET_KEY")
-
 
 def _headers() -> Dict[str, str]:
     if not API_KEY or not API_SECRET:
@@ -25,18 +25,19 @@ def _headers() -> Dict[str, str]:
         "Accept": "application/json",
     }
 
-
+# -----------------------------
+# INDICADORES
+# -----------------------------
 def _ema(values: List[float], period: int) -> float:
     if not values:
         return 0.0
     if len(values) < period:
         return float(values[-1])
     k = 2 / (period + 1)
-    ema_val = float(values[0])
+    ema = float(values[0])
     for v in values[1:]:
-        ema_val = float(v) * k + ema_val * (1 - k)
-    return float(ema_val)
-
+        ema = float(v) * k + ema * (1 - k)
+    return float(ema)
 
 def _rsi(values: List[float], period: int = 14) -> float:
     if len(values) < period + 1:
@@ -54,12 +55,10 @@ def _rsi(values: List[float], period: int = 14) -> float:
     rs = gains / losses
     return 100.0 - (100.0 / (1.0 + rs))
 
-
 def _infer_bias_and_strength(price: float, ema_fast: float, ema_slow: float, rsi: float) -> Dict[str, Any]:
-    # separación relativa EMA
+    # separación relativa EMA (suave)
     sep = abs(ema_fast - ema_slow) / max(price, 1e-9)
 
-    # bias
     if ema_fast > ema_slow and rsi >= 52:
         bias = "bullish"
     elif ema_fast < ema_slow and rsi <= 48:
@@ -67,7 +66,6 @@ def _infer_bias_and_strength(price: float, ema_fast: float, ema_slow: float, rsi
     else:
         bias = "neutral"
 
-    # strength 1..3 (suave)
     strength = 1
     if sep >= 0.0015:
         strength = 2
@@ -77,46 +75,53 @@ def _infer_bias_and_strength(price: float, ema_fast: float, ema_slow: float, rsi
     if bias == "neutral":
         strength = 1
 
-    return {"bias_inferred": bias, "trend_strength": strength, "sep": sep}
+    return {"bias_inferred": bias, "trend_strength": int(strength), "sep": float(sep)}
 
+def _parse_symbols(symbol: Optional[str], symbols: Optional[str]) -> List[str]:
+    # permite symbol=QQQ o symbols=QQQ,SPY,NVDA
+    raw = symbols or symbol or "QQQ"
+    out: List[str] = []
+    for s in str(raw).split(","):
+        s = s.strip().upper()
+        if s:
+            out.append(s)
+    return out or ["QQQ"]
 
 @router.get("/indicators")
 def indicators(
-    # soporta symbol=QQQ (uno) o symbols=QQQ,SPY,NVDA (varios)
-    symbol: Optional[str] = Query(default=None),
-    symbols: str = Query(default="QQQ,SPY,NVDA"),
-    timeframe: str = Query(default="5Min"),
-    limit: int = Query(default=60, ge=10, le=1000),
+    symbol: Optional[str] = Query(None, description="Alias: un solo símbolo (ej: QQQ)"),
+    symbols: Optional[str] = Query("QQQ,SPY,NVDA", description="Lista CSV (ej: QQQ,SPY,NVDA)"),
+    timeframe: str = Query("5Min", description="Ej: 1Min, 5Min, 15Min, 1Hour, 1Day"),
+    time_frame: Optional[str] = Query(None, description="Alias de timeframe"),
+    limit: int = Query(60, ge=10, le=1000),
+    feed: str = Query("iex", description="iex (free) o sip (requiere plan). Default iex."),
 ):
-    # Decide lista final de símbolos
-    if symbol and str(symbol).strip():
-        syms = [str(symbol).strip().upper()]
-    else:
-        syms = [s.strip().upper() for s in str(symbols).split(",") if s.strip()]
-        if not syms:
-            syms = ["QQQ"]
+    syms = _parse_symbols(symbol=symbol, symbols=symbols)
+    tf = (time_frame or timeframe or "5Min").strip()
+    feed = (feed or "iex").strip().lower()
 
     end = datetime.utcnow()
     start = end - timedelta(hours=8)
 
-    # Alpaca Market Data: /v2/stocks/bars
     url = f"{DATA_URL}/v2/stocks/bars"
     params = {
         "symbols": ",".join(syms),
-        "timeframe": timeframe,
+        "timeframe": tf,
         "start": start.isoformat() + "Z",
         "end": end.isoformat() + "Z",
         "limit": str(limit),
         "adjustment": "raw",
+        # ✅ clave para evitar 403 en cuentas sin SIP
+        "feed": feed,
     }
 
     try:
         r = requests.get(url, headers=_headers(), params=params, timeout=12)
     except Exception as e:
-        raise HTTPException(status_code=502, detail={"message": "Network error calling Alpaca", "error": str(e), "url": url})
+        raise HTTPException(status_code=502, detail={"message": f"Error calling Alpaca bars: {e}", "url": url, "params": params})
 
     if r.status_code != 200:
-        # devuelve detalles útiles para debug
+        # devuelve detalle completo para debug
         raise HTTPException(
             status_code=r.status_code,
             detail={
@@ -128,25 +133,19 @@ def indicators(
             },
         )
 
-    payload = r.json() if r.text else {}
+    payload = r.json()
     bars = payload.get("bars", {}) if isinstance(payload, dict) else {}
 
     out: Dict[str, Any] = {}
-
     for sym in syms:
         rows = bars.get(sym, []) if isinstance(bars, dict) else []
-        closes = []
-        for x in rows:
-            try:
-                closes.append(float(x.get("c")))
-            except Exception:
-                continue
+        closes = [float(x.get("c")) for x in rows if isinstance(x, dict) and x.get("c") is not None]
 
         if len(closes) < 20:
             out[sym] = {"status": "insufficient_data", "count": len(closes)}
             continue
 
-        price = closes[-1]
+        price = float(closes[-1])
         ema_fast = _ema(closes[-30:], 9)
         ema_slow = _ema(closes[-60:], 21)
         rsi_val = _rsi(closes, 14)
@@ -155,10 +154,21 @@ def indicators(
         out[sym] = {
             "status": "ok",
             "price": price,
-            "ema_fast": ema_fast,
-            "ema_slow": ema_slow,
-            "rsi": rsi_val,
+            "ema_fast": float(ema_fast),
+            "ema_slow": float(ema_slow),
+            "rsi": float(rsi_val),
             **inf,
         }
 
-    return {"status": "ok", "data": out, "meta": {"data_url": DATA_URL, "timeframe": timeframe, "limit": limit, "symbols": syms}}
+    return {
+        "status": "ok",
+        "data": out,
+        "meta": {
+            "data_url": DATA_URL,
+            "endpoint": "/v2/stocks/bars",
+            "timeframe": tf,
+            "limit": limit,
+            "feed": feed,
+            "symbols": syms,
+        },
+    }
