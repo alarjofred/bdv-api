@@ -1,12 +1,17 @@
 from fastapi import APIRouter, HTTPException
 import os
 import requests
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 # 🔔 Import para enviar mensajes a Telegram
 from routes.telegram_notify import send_telegram_message, send_alert
 
 router = APIRouter(tags=["trade"])
+
+
+def _bool_env(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name, "true" if default else "false")
+    return str(raw).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
 def get_alpaca_headers() -> dict:
@@ -31,14 +36,71 @@ def get_alpaca_headers() -> dict:
     }
 
 
-def _alpaca_base_url() -> str:
-    """
-    Normaliza APCA_TRADING_URL para que termine en /v2 (paper o live).
-    """
-    base_url = os.getenv("APCA_TRADING_URL", "https://paper-api.alpaca.markets/v2").rstrip("/")
+def _normalize_v2(base_url: str) -> str:
+    base_url = (base_url or "").strip().rstrip("/")
+    if not base_url:
+        return ""
     if not base_url.endswith("/v2"):
-        base_url = base_url.rstrip("/") + "/v2"
+        base_url = base_url + "/v2"
     return base_url
+
+
+def _resolve_alpaca_mode(payload: Dict[str, Any]) -> str:
+    """
+    Decide si se manda a paper o live.
+
+    Prioridad:
+      1) payload["alpaca_mode"] si viene (paper/live)
+      2) env ALPACA_MODE (paper/live)
+      3) paper
+    """
+    mode = str(payload.get("alpaca_mode", "") or "").strip().lower()
+    if mode in ("paper", "live"):
+        return mode
+
+    env_mode = str(os.getenv("ALPACA_MODE", "paper") or "paper").strip().lower()
+    if env_mode in ("paper", "live"):
+        return env_mode
+
+    return "paper"
+
+
+def _alpaca_base_url_for_mode(mode: str) -> str:
+    """
+    Retorna la base /v2 según modo.
+
+    Variables recomendadas:
+      - APCA_TRADING_URL_PAPER=https://paper-api.alpaca.markets
+      - APCA_TRADING_URL_LIVE=https://api.alpaca.markets
+
+    Fallback:
+      - si existen APCA_TRADING_URL / APCA_TRADING_URL ya con paper/live, se usa solo como último recurso
+    """
+    mode = (mode or "paper").strip().lower()
+
+    paper = os.getenv("APCA_TRADING_URL_PAPER", "https://paper-api.alpaca.markets").strip()
+    live = os.getenv("APCA_TRADING_URL_LIVE", "https://api.alpaca.markets").strip()
+
+    if mode == "live":
+        return _normalize_v2(live)
+
+    return _normalize_v2(paper)
+
+
+def _ensure_live_allowed(requested_mode: str) -> None:
+    """
+    Guardrail anti-accidente:
+    Si alguien pide live pero LIVE_TRADING_ENABLED no está true => bloquea.
+    """
+    if requested_mode == "live" and not _bool_env("LIVE_TRADING_ENABLED", False):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "message": "Live trading is disabled by server policy",
+                "hint": "Set LIVE_TRADING_ENABLED=true to allow alpaca_mode=live",
+                "requested_mode": requested_mode,
+            },
+        )
 
 
 @router.post("/trade")
@@ -46,6 +108,11 @@ def place_trade(payload: Dict[str, Any]):
     """
     Enviar una orden a Alpaca (acciones).
     Nota: Opciones NO se envían por /v2/orders; requieren el stack de options/trading correspondiente.
+
+    ✅ Dual paper/live:
+      - payload puede incluir: {"alpaca_mode":"paper"} o {"alpaca_mode":"live"}
+      - si no viene, usa env ALPACA_MODE (default paper)
+      - LIVE requiere LIVE_TRADING_ENABLED=true
     """
 
     symbol = payload.get("symbol")
@@ -78,7 +145,14 @@ def place_trade(payload: Dict[str, Any]):
     if qty_int <= 0:
         raise HTTPException(status_code=400, detail="El campo 'qty' debe ser > 0")
 
-    base_url = _alpaca_base_url()
+    # ✅ Determina paper/live (y valida Live permitido)
+    alpaca_mode = _resolve_alpaca_mode(payload)
+    _ensure_live_allowed(alpaca_mode)
+
+    base_url = _alpaca_base_url_for_mode(alpaca_mode)
+    if not base_url:
+        raise HTTPException(status_code=500, detail="No se pudo resolver la URL base de Alpaca (/v2)")
+
     url = f"{base_url}/orders"
 
     # ✅ Defaults explícitos (pero permitimos override si más adelante lo necesitas)
@@ -115,7 +189,7 @@ def place_trade(payload: Dict[str, Any]):
             "price": order_type,
             "target": "-",
             "stop": "-",
-            "mode": "Solicitud desde GPT BDV"
+            "mode": f"Solicitud BDV ({alpaca_mode.upper()})",
         })
     except Exception as e:
         print(f"[WARN] No se pudo enviar alerta de solicitud: {e}")
@@ -123,25 +197,30 @@ def place_trade(payload: Dict[str, Any]):
     # Llamada a Alpaca
     try:
         r = requests.post(url, headers=get_alpaca_headers(), json=body, timeout=15)
-        data = r.json() if r.text else {}
+        raw_text = r.text or ""
+        try:
+            data = r.json() if raw_text else {}
+        except Exception:
+            data = {"raw": raw_text}
     except Exception as e:
         raise HTTPException(
             status_code=502,
             detail={
                 "message": f"Error de red llamando a Alpaca: {e}",
                 "alpaca_url": url,
+                "alpaca_mode": alpaca_mode,
             },
         )
 
-    # ✅ Si Alpaca rechaza, devuelve 400/422 al cliente (no 502)
+    # ✅ Si Alpaca rechaza, devuelve su status al cliente
     if r.status_code >= 400:
-        # Mapea: 401/403 auth, 422 validation, 429 rate limit, etc.
         raise HTTPException(
             status_code=r.status_code,
             detail={
                 "message": "Alpaca rechazó la orden",
                 "alpaca_status": r.status_code,
                 "alpaca_url": url,
+                "alpaca_mode": alpaca_mode,
                 "alpaca_body": data,
                 "sent_body": body,
             },
@@ -161,7 +240,7 @@ def place_trade(payload: Dict[str, Any]):
             "price": data.get("filled_avg_price", order_type) if isinstance(data, dict) else order_type,
             "target": "-",
             "stop": "-",
-            "mode": "Paper" if "paper" in base_url else "Live",
+            "mode": alpaca_mode.upper(),
             "status": status_text
         })
     except Exception as e:
@@ -169,6 +248,7 @@ def place_trade(payload: Dict[str, Any]):
 
     message = (
         "⚡ <b>BDV — Orden enviada</b>\n"
+        f"Modo: <b>{alpaca_mode.upper()}</b>\n"
         f"Símbolo: <b>{symbol}</b>\n"
         f"Side: <b>{side.upper()}</b>\n"
         f"Cantidad: <b>{qty_int}</b>\n"
@@ -179,9 +259,11 @@ def place_trade(payload: Dict[str, Any]):
 
     return {
         "status": "ok",
+        "alpaca_mode": alpaca_mode,
         "alpaca_url": url,
         "alpaca_order": data,
         "telegram_notify": telegram_result,
+        "sent_body": body,
     }
 
 
