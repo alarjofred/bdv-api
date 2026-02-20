@@ -1,20 +1,16 @@
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException
 import os
 import requests
 from typing import Dict, Any, List, Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 router = APIRouter(prefix="/snapshot", tags=["snapshot"])
 
-# -----------------------------
-# ENV (NORMALIZACIÓN)
-# -----------------------------
-_raw_data = os.getenv("APCA_DATA_URL", "https://data.alpaca.markets").rstrip("/")
-# Si viene con /v2, lo quitamos para evitar /v2/v2/...
-DATA_URL = _raw_data[:-3] if _raw_data.endswith("/v2") else _raw_data
-
+# DATA_URL base SIN /v2
+DATA_URL = os.getenv("APCA_DATA_URL", "https://data.alpaca.markets").rstrip("/")
 API_KEY = os.getenv("APCA_API_KEY_ID")
 API_SECRET = os.getenv("APCA_API_SECRET_KEY")
+
 
 def _headers() -> Dict[str, str]:
     if not API_KEY or not API_SECRET:
@@ -25,19 +21,18 @@ def _headers() -> Dict[str, str]:
         "Accept": "application/json",
     }
 
-# -----------------------------
-# INDICADORES
-# -----------------------------
+
 def _ema(values: List[float], period: int) -> float:
     if not values:
         return 0.0
     if len(values) < period:
-        return float(values[-1])
+        return values[-1]
     k = 2 / (period + 1)
-    ema = float(values[0])
+    ema = values[0]
     for v in values[1:]:
-        ema = float(v) * k + ema * (1 - k)
+        ema = v * k + ema * (1 - k)
     return float(ema)
+
 
 def _rsi(values: List[float], period: int = 14) -> float:
     if len(values) < period + 1:
@@ -45,7 +40,7 @@ def _rsi(values: List[float], period: int = 14) -> float:
     gains = 0.0
     losses = 0.0
     for i in range(-period, 0):
-        diff = float(values[i]) - float(values[i - 1])
+        diff = values[i] - values[i - 1]
         if diff >= 0:
             gains += diff
         else:
@@ -55,8 +50,8 @@ def _rsi(values: List[float], period: int = 14) -> float:
     rs = gains / losses
     return 100.0 - (100.0 / (1.0 + rs))
 
+
 def _infer_bias_and_strength(price: float, ema_fast: float, ema_slow: float, rsi: float) -> Dict[str, Any]:
-    # separación relativa EMA (suave)
     sep = abs(ema_fast - ema_slow) / max(price, 1e-9)
 
     if ema_fast > ema_slow and rsi >= 52:
@@ -71,57 +66,38 @@ def _infer_bias_and_strength(price: float, ema_fast: float, ema_slow: float, rsi
         strength = 2
     if sep >= 0.0030:
         strength = 3
-
     if bias == "neutral":
         strength = 1
 
-    return {"bias_inferred": bias, "trend_strength": int(strength), "sep": float(sep)}
+    return {"bias_inferred": bias, "trend_strength": strength, "sep": float(sep)}
 
-def _parse_symbols(symbol: Optional[str], symbols: Optional[str]) -> List[str]:
-    # permite symbol=QQQ o symbols=QQQ,SPY,NVDA
-    raw = symbols or symbol or "QQQ"
-    out: List[str] = []
-    for s in str(raw).split(","):
-        s = s.strip().upper()
-        if s:
-            out.append(s)
-    return out or ["QQQ"]
 
-@router.get("/indicators")
-def indicators(
-    symbol: Optional[str] = Query(None, description="Alias: un solo símbolo (ej: QQQ)"),
-    symbols: Optional[str] = Query("QQQ,SPY,NVDA", description="Lista CSV (ej: QQQ,SPY,NVDA)"),
-    timeframe: str = Query("5Min", description="Ej: 1Min, 5Min, 15Min, 1Hour, 1Day"),
-    time_frame: Optional[str] = Query(None, description="Alias de timeframe"),
-    limit: int = Query(60, ge=10, le=1000),
-    feed: str = Query("iex", description="iex (free) o sip (requiere plan). Default iex."),
-):
-    syms = _parse_symbols(symbol=symbol, symbols=symbols)
-    tf = (time_frame or timeframe or "5Min").strip()
-    feed = (feed or "iex").strip().lower()
-
-    end = datetime.utcnow()
-    start = end - timedelta(hours=8)
-
+def _fetch_bars_multi(
+    syms: List[str],
+    timeframe: str,
+    limit: int,
+    hours_back: int,
+    feed: Optional[str] = None,
+) -> Dict[str, Any]:
+    # endpoint multi-symbol
     url = f"{DATA_URL}/v2/stocks/bars"
-    params = {
+
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(hours=hours_back)
+
+    params: Dict[str, Any] = {
         "symbols": ",".join(syms),
-        "timeframe": tf,
-        "start": start.isoformat() + "Z",
-        "end": end.isoformat() + "Z",
+        "timeframe": timeframe,
+        "start": start.isoformat().replace("+00:00", "Z"),
+        "end": end.isoformat().replace("+00:00", "Z"),
         "limit": str(limit),
         "adjustment": "raw",
-        # ✅ clave para evitar 403 en cuentas sin SIP
-        "feed": feed,
     }
+    if feed:
+        params["feed"] = feed  # clave para planes sin SIP
 
-    try:
-        r = requests.get(url, headers=_headers(), params=params, timeout=12)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail={"message": f"Error calling Alpaca bars: {e}", "url": url, "params": params})
-
+    r = requests.get(url, headers=_headers(), params=params, timeout=15)
     if r.status_code != 200:
-        # devuelve detalle completo para debug
         raise HTTPException(
             status_code=r.status_code,
             detail={
@@ -132,16 +108,18 @@ def indicators(
                 "params": params,
             },
         )
+    return r.json()
 
-    payload = r.json()
+
+def _compute_indicators_from_payload(syms: List[str], payload: Dict[str, Any], min_needed: int = 20) -> Dict[str, Any]:
     bars = payload.get("bars", {}) if isinstance(payload, dict) else {}
-
     out: Dict[str, Any] = {}
+
     for sym in syms:
         rows = bars.get(sym, []) if isinstance(bars, dict) else []
-        closes = [float(x.get("c")) for x in rows if isinstance(x, dict) and x.get("c") is not None]
+        closes = [float(x["c"]) for x in rows if isinstance(x, dict) and "c" in x]
 
-        if len(closes) < 20:
+        if len(closes) < min_needed:
             out[sym] = {"status": "insufficient_data", "count": len(closes)}
             continue
 
@@ -160,15 +138,63 @@ def indicators(
             **inf,
         }
 
+    return out
+
+
+@router.get("/indicators")
+def indicators(
+    # Swagger a veces envía symbol=QQQ, así que soportamos ambos
+    symbol: Optional[str] = None,
+    symbols: str = "QQQ,SPY,NVDA",
+    timeframe: str = "5Min",
+    limit: int = 60,
+):
+    # Normaliza símbolos
+    if symbol and str(symbol).strip():
+        syms = [str(symbol).strip().upper()]
+    else:
+        syms = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+        if not syms:
+            syms = ["QQQ"]
+
+    # 1) Intento intradía con IEX (evita error SIP)
+    intraday_payload = _fetch_bars_multi(
+        syms=syms,
+        timeframe=timeframe,
+        limit=limit,
+        hours_back=8,
+        feed="iex",
+    )
+    out = _compute_indicators_from_payload(syms, intraday_payload, min_needed=20)
+
+    # 2) Fallback: si un símbolo no tiene data suficiente, usamos 1Day (casi siempre permitido)
+    need_fallback = [s for s in syms if out.get(s, {}).get("status") != "ok"]
+    fallback_meta: Dict[str, Any] = {}
+
+    if need_fallback:
+        daily_payload = _fetch_bars_multi(
+            syms=need_fallback,
+            timeframe="1Day",
+            limit=max(60, limit),
+            hours_back=24 * 120,  # 120 días
+            feed=None,  # daily suele funcionar sin feed
+        )
+        daily_out = _compute_indicators_from_payload(need_fallback, daily_payload, min_needed=20)
+
+        for s in need_fallback:
+            if daily_out.get(s, {}).get("status") == "ok":
+                out[s] = daily_out[s]
+                fallback_meta[s] = {"used_fallback": True, "fallback_timeframe": "1Day"}
+
     return {
         "status": "ok",
         "data": out,
         "meta": {
             "data_url": DATA_URL,
-            "endpoint": "/v2/stocks/bars",
-            "timeframe": tf,
-            "limit": limit,
-            "feed": feed,
-            "symbols": syms,
+            "intraday_endpoint": "/v2/stocks/bars",
+            "intraday_feed": "iex",
+            "intraday_timeframe": timeframe,
+            "intraday_limit": limit,
+            "fallback": fallback_meta,
         },
     }
