@@ -1,13 +1,11 @@
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
-from pydantic import BaseModel
 from typing import Optional, Literal
 import os
-import json
 import requests
 from datetime import datetime
+import json
 
 # ---------------------------------
 # Cargar variables del entorno
@@ -61,9 +59,19 @@ from routes.monitor import router as monitor_router
 from routes.signals_ai import router as signals_ai_router
 from routes.alpaca_close import router as alpaca_close_router
 from routes.agent import router as agent_router  # ✅ routes/agent.py (correcto)
+
+# ✅ IMPORTS COMO ROUTERS (estos son los correctos para /trade, telegram, pending_trades)
 from routes import trade
 from routes import telegram_notify
 from routes import pending_trades
+
+# ✅ NUEVO: snapshot router (para /snapshot/indicators)
+# Si el archivo existe y está bien, Swagger lo mostrará.
+try:
+    from routes.snapshot import router as snapshot_router
+except Exception as e:
+    snapshot_router = None
+    print(f"[WARN] No se pudo importar routes.snapshot: {e}")
 
 # Estos pueden fallar si el archivo no existe / tiene error.
 try:
@@ -104,6 +112,7 @@ def root():
         "persist_dir": PERSIST_DIR,
         "apca_data_url": APCA_DATA_URL,
         "apca_trading_url": APCA_TRADING_URL,
+        "snapshot_router_loaded": bool(snapshot_router is not None),
     }
 
 
@@ -123,9 +132,16 @@ app.include_router(monitor_router)
 app.include_router(signals_ai_router)
 app.include_router(alpaca_close_router)
 app.include_router(agent_router)  # ✅ AGENTE
+
+# ✅ IMPORTANTE: /trade debe venir SOLO de routes/trade.py
 app.include_router(trade.router)
+
 app.include_router(telegram_notify.router)
 app.include_router(pending_trades.router)
+
+# ✅ Agrega snapshot router si existe (esto habilita /snapshot/indicators)
+if snapshot_router is not None:
+    app.include_router(snapshot_router)
 
 if analysis is not None:
     app.include_router(analysis.router)
@@ -150,7 +166,7 @@ def get_latest_quote(symbol: str) -> dict:
 
 
 # ---------------------------------
-# Endpoint /snapshot
+# Endpoint /snapshot (SE MANTIENE porque monitor.py lo usa)
 # ---------------------------------
 @app.get("/snapshot")
 def market_snapshot():
@@ -185,18 +201,6 @@ def market_snapshot():
 
 
 # ---------------------------------
-# Modelo para /trade
-# ---------------------------------
-class TradeRequest(BaseModel):
-    symbol: str
-    side: Literal["buy", "sell"]
-    qty: int
-    type: Literal["market", "limit"] = "market"
-    time_in_force: Literal["day", "gtc"] = "day"
-    limit_price: Optional[float] = None
-
-
-# ---------------------------------
 # Log de trades en archivo persistente
 # ---------------------------------
 def append_trade_log(entry: dict) -> None:
@@ -207,74 +211,6 @@ def append_trade_log(entry: dict) -> None:
             f.write(line + "\n")
     except Exception as e:
         print(f"[WARN] No se pudo escribir en el log de trades: {e}")
-
-
-# ---------------------------------
-# Endpoint /trade (ejecutar orden en Alpaca)
-# ---------------------------------
-@app.post("/trade")
-def place_trade(req: TradeRequest):
-    """
-    Envía una orden a Alpaca y la registra en el log persistente.
-    """
-    if not has_alpaca_keys():
-        raise HTTPException(status_code=500, detail="Faltan keys de Alpaca para /trade.")
-
-    orders_url = f"{APCA_TRADING_URL}/orders"
-    payload = {
-        "symbol": req.symbol,
-        "qty": req.qty,
-        "side": req.side,
-        "type": req.type,
-        "time_in_force": req.time_in_force,
-    }
-
-    if req.type == "limit" and req.limit_price is not None:
-        payload["limit_price"] = req.limit_price
-
-    try:
-        print(f"[DBG] Enviando orden Alpaca: {payload}")
-        r = requests.post(orders_url, headers=alpaca_headers(), json=payload, timeout=10)
-        raw_text = r.text
-        print(f"[DBG] Respuesta Alpaca: {r.status_code} {raw_text[:300]}")
-
-        try:
-            body = r.json()
-        except Exception:
-            body = {"raw": raw_text}
-
-        status = "ok" if r.status_code < 400 else "error"
-
-        log_entry = {
-            "timestamp_utc": datetime.utcnow().isoformat(),
-            "symbol": req.symbol,
-            "side": req.side,
-            "qty": req.qty,
-            "type": req.type,
-            "time_in_force": req.time_in_force,
-            "status": status,
-            "http_status": r.status_code,
-            "alpaca_response": body,
-        }
-        append_trade_log(log_entry)
-
-        if status == "error":
-            raise HTTPException(
-                status_code=502,
-                detail={
-                    "message": "Error placing order in Alpaca",
-                    "alpaca_status": r.status_code,
-                    "alpaca_body": body,
-                },
-            )
-
-        return {"status": "ok", "order": body}
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"[ERR] /trade: {e}")
-        raise HTTPException(status_code=500, detail=f"Unexpected error placing trade: {e}")
 
 
 # ---------------------------------
