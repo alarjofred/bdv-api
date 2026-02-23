@@ -1,16 +1,11 @@
-from fastapi import APIRouter, HTTPException, Header
+from fastapi import APIRouter, HTTPException, Header, Request
 import os
 import requests
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Dict, Any, List, Optional, Tuple
 
-# ✅ Importa también save_pending_trades si lo tienes en pending_trades.py
 from .pending_trades import PENDING_TRADES
-try:
-    from .pending_trades import save_pending_trades  # opcional
-except Exception:
-    save_pending_trades = None
 
 router = APIRouter(prefix="/monitor", tags=["monitor"])
 
@@ -66,7 +61,7 @@ MARKET_CTX_FEED = os.getenv("APCA_DATA_FEED", "").strip().lower()  # iex/sip (si
 DEFAULT_ALPACA_MODE = os.getenv("ALPACA_MODE", "paper").strip().lower()  # paper | live
 
 # =====================================================
-# ✅ NUEVO: CIERRE ASISTIDO POR IA (apagado por defecto)
+# ✅ CIERRE ASISTIDO POR IA (apagado por defecto)
 # =====================================================
 AI_CLOSE_ENABLED = _bool_env("AI_CLOSE_ENABLED", False)
 AI_CLOSE_MIN_CONF = _env_float("AI_CLOSE_MIN_CONF", 0.75)
@@ -229,7 +224,6 @@ def _execute_trade_via_http(symbol: str, side: str, qty: int, alpaca_mode: Optio
     url = f"{API_BASE.rstrip('/')}/trade"
     payload: Dict[str, Any] = {"symbol": symbol, "side": side, "qty": qty}
 
-    # No rompe aunque trade.py aún no lo use
     if alpaca_mode in ("paper", "live"):
         payload["alpaca_mode"] = alpaca_mode
 
@@ -255,24 +249,33 @@ def _get_snapshot_prices() -> Dict[str, Dict[str, Any]]:
         return {}
 
 
+def _pending_trades_iterable():
+    """
+    Soporta PENDING_TRADES como dict o como list.
+    """
+    if isinstance(PENDING_TRADES, dict):
+        return list(PENDING_TRADES.values())
+    if isinstance(PENDING_TRADES, list):
+        return list(PENDING_TRADES)
+    return []
+
+
 def _process_pending_trades(snapshot_data: Dict[str, Dict[str, Any]], allow_execute: bool) -> List[Dict[str, Any]]:
     """
-    allow_execute=False: solo detecta triggers, NO ejecuta /trade.
-    allow_execute=True: ejecuta /trade y marca triggered.
+    allow_execute=False: solo detecta triggers y marca, NO ejecuta /trade.
+    allow_execute=True: ejecuta /trade.
     """
     now = datetime.utcnow()
     ejecuciones: List[Dict[str, Any]] = []
-    changed = False
 
-    # ✅ Soporta PENDING_TRADES como LISTA
-    for trade in list(PENDING_TRADES):
+    for trade in _pending_trades_iterable():
         if getattr(trade, "status", None) != "pending":
             continue
 
         valid_until = getattr(trade, "valid_until", None)
         if valid_until and now > valid_until:
             trade.status = "expired"
-            changed = True
+            trade.expired_at = now
             ejecuciones.append({
                 "id": trade.id,
                 "symbol": trade.symbol,
@@ -298,7 +301,7 @@ def _process_pending_trades(snapshot_data: Dict[str, Dict[str, Any]], allow_exec
         if allow_execute:
             out = _execute_trade_via_http(trade.symbol, trade.side, trade.qty)
             trade.status = "triggered"
-            changed = True
+            trade.triggered_at = now
             ejecuciones.append({
                 "id": trade.id,
                 "symbol": trade.symbol,
@@ -321,13 +324,6 @@ def _process_pending_trades(snapshot_data: Dict[str, Dict[str, Any]], allow_exec
                 "price_at_trigger": price,
                 "status": "trigger_detected",
             })
-
-    # ✅ Persistencia opcional si existe save_pending_trades()
-    if changed and callable(save_pending_trades):
-        try:
-            save_pending_trades(PENDING_TRADES)
-        except Exception:
-            pass
 
     return ejecuciones
 
@@ -376,9 +372,6 @@ def _ai_symbols() -> List[str]:
     return out or ["QQQ"]
 
 
-# ==============================
-# ✅ PASO 2: Market context live
-# ==============================
 def _get_market_context(symbols: List[str]) -> Dict[str, Any]:
     """
     Llama a /snapshot/indicators para obtener bias_inferred + trend_strength por símbolo.
@@ -406,6 +399,11 @@ def _get_market_context(symbols: List[str]) -> Dict[str, Any]:
 
 
 def _market_gate_allows(ctx: Dict[str, Any], side: str) -> Tuple[bool, str]:
+    """
+    Reglas simples:
+      - si trend_strength < MARKET_TREND_MIN => NO auto-entry
+      - si bias fuerte contradice el side => NO auto-entry
+    """
     if not MARKET_CTX_ENABLED:
         return True, "market_ctx_disabled"
 
@@ -562,8 +560,16 @@ def _set_last_entry(symbol: str, side: str) -> None:
 
 
 @router.get("/tick")
-def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
+def monitor_tick(request: Request, x_bdv_secret: Optional[str] = Header(default=None)):
     _require_agent_secret(x_bdv_secret)
+
+    # ✅ Fallback: si no seteaste RENDER_EXTERNAL_URL, usa la URL del request
+    global API_BASE
+    if not API_BASE:
+        try:
+            API_BASE = str(request.base_url).rstrip("/")
+        except Exception:
+            pass
 
     inside, rth_reason = _is_inside_rth()
     if not inside:
@@ -577,6 +583,8 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
 
     alpaca_mode = _get_alpaca_mode_from_config(config)
     recommend_enabled = _bool_env("RECOMMEND_AUTO_ENABLED", False)
+
+    is_auto = (exec_mode == "auto")
 
     actions: Dict[str, Any] = {
         "closed_all": False,
@@ -598,6 +606,7 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
             "market_ctx_limit": MARKET_CTX_LIMIT,
             "market_ctx_lookback_hours": MARKET_CTX_LOOKBACK_HOURS,
             "alpaca_mode": alpaca_mode,
+
             "ai_close_enabled": AI_CLOSE_ENABLED,
             "ai_close_min_conf": AI_CLOSE_MIN_CONF,
             "ai_close_trend_min": AI_CLOSE_TREND_MIN,
@@ -605,8 +614,12 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
         "config_echo": {"execution_mode": exec_mode, "risk_mode": risk_mode},
     }
 
-    # ✅ Importante: ahora NO salimos si exec_mode=manual
-    # Manual solo bloquea ENTRADAS; cierres/riesgo siguen funcionando.
+    if not is_auto:
+        actions["auto_entry"] = {
+            "status": "skipped",
+            "reason": "execution_mode_not_auto",
+            "detail": f"execution_mode='{exec_mode}' (no es 'auto')",
+        }
 
     account, positions = get_account_and_positions()
     equity = float(account.get("equity", 0.0))
@@ -634,46 +647,44 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
         actions["closed_all"] = True
         actions["reason_all"] = "Hora límite 15:45 NY"
         actions["close_all_response"] = result
+        return _with_build_id({"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "positions_count": len(positions), "actions": actions})
 
-    if positions and (not actions["closed_all"]) and pnl_today >= daily_target_abs:
+    if positions and pnl_today >= daily_target_abs:
         result = close_all_via_api()
         actions["closed_all"] = True
         actions["reason_all"] = "Meta diaria alcanzada"
         actions["close_all_response"] = result
+        return _with_build_id({"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "positions_count": len(positions), "actions": actions})
 
-    if positions and (not actions["closed_all"]) and pnl_today <= daily_max_loss_abs:
+    if positions and pnl_today <= daily_max_loss_abs:
         result = close_all_via_api()
         actions["closed_all"] = True
         actions["reason_all"] = "Pérdida diaria máxima alcanzada"
         actions["close_all_response"] = result
+        return _with_build_id({"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "positions_count": len(positions), "actions": actions})
 
-    # TP/SL por posición (si no cerramos todo)
-    if positions and not actions["closed_all"]:
-        for pos in positions:
-            symbol = pos.get("symbol")
-            if not symbol:
-                continue
+    # TP/SL por posición
+    for pos in positions:
+        symbol = pos.get("symbol")
+        if not symbol:
+            continue
 
-            try:
-                plpc = float(pos.get("unrealized_plpc", 0.0))
-            except (TypeError, ValueError):
-                plpc = 0.0
+        try:
+            plpc = float(pos.get("unrealized_plpc", 0.0))
+        except (TypeError, ValueError):
+            plpc = 0.0
 
-            if plpc >= params["tp_per_trade"]:
-                resp = close_symbol_via_api(symbol)
-                actions["closed_symbols"].append({"symbol": symbol, "reason": f"Take profit ({plpc:.2%})", "api_response": resp})
-            elif plpc <= -params["sl_per_trade"]:
-                resp = close_symbol_via_api(symbol)
-                actions["closed_symbols"].append({"symbol": symbol, "reason": f"Stop loss ({plpc:.2%})", "api_response": resp})
+        if plpc >= params["tp_per_trade"]:
+            resp = close_symbol_via_api(symbol)
+            actions["closed_symbols"].append({"symbol": symbol, "reason": f"Take profit ({plpc:.2%})", "api_response": resp})
+        elif plpc <= -params["sl_per_trade"]:
+            resp = close_symbol_via_api(symbol)
+            actions["closed_symbols"].append({"symbol": symbol, "reason": f"Stop loss ({plpc:.2%})", "api_response": resp})
 
-    # =====================================================
-    # ✅ AI CLOSE (solo si hay posiciones y está habilitado)
-    #   - Cierra si IA da señal contraria con confianza alta
-    #   - Audita en actions["ai_close"]
-    # =====================================================
+    # ✅ AI CLOSE (solo si hay posiciones)
     actions["ai_close"] = {"enabled": AI_CLOSE_ENABLED, "attempts": [], "closed": []}
 
-    if AI_CLOSE_ENABLED and positions and not actions["closed_all"]:
+    if AI_CLOSE_ENABLED and positions:
         already_closed = set([str(x.get("symbol", "")).upper() for x in actions.get("closed_symbols", []) if isinstance(x, dict)])
 
         pos_symbols = []
@@ -711,13 +722,17 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
                 ts = 1
 
             if ts < AI_CLOSE_TREND_MIN:
-                actions["ai_close"]["attempts"].append({"symbol": symbol, "skip": f"trend_strength<{AI_CLOSE_TREND_MIN}", "ctx": ctx})
+                actions["ai_close"]["attempts"].append({
+                    "symbol": symbol,
+                    "skip": f"trend_strength<{AI_CLOSE_TREND_MIN}",
+                    "ctx": ctx,
+                })
                 continue
 
             ai_payload = _get_signals_ai(symbol, bias=bias, trend_strength=ts)
             summary = _summarize_ai(ai_payload)
-            data = ai_payload.get("data", ai_payload) if isinstance(ai_payload, dict) else {}
 
+            data = ai_payload.get("data", ai_payload) if isinstance(ai_payload, dict) else {}
             try:
                 conf = float(data.get("confidence", 0) or 0)
             except Exception:
@@ -737,42 +752,49 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
             if conf < AI_CLOSE_MIN_CONF:
                 continue
 
-            # Long + IA dice SELL => cerrar
             if qty_pos > 0 and ai_action == "sell":
                 resp = close_symbol_via_api(symbol)
-                actions["ai_close"]["closed"].append({"symbol": symbol, "reason": "ai_opposite_signal_for_long", "ai_conf": conf, "ctx": ctx, "api_response": resp})
+                actions["ai_close"]["closed"].append({
+                    "symbol": symbol,
+                    "reason": "ai_opposite_signal_for_long",
+                    "ai_conf": conf,
+                    "ctx": ctx,
+                    "api_response": resp,
+                })
                 already_closed.add(symbol)
 
-            # Short + IA dice BUY => cerrar
             elif qty_pos < 0 and ai_action == "buy":
                 resp = close_symbol_via_api(symbol)
-                actions["ai_close"]["closed"].append({"symbol": symbol, "reason": "ai_opposite_signal_for_short", "ai_conf": conf, "ctx": ctx, "api_response": resp})
+                actions["ai_close"]["closed"].append({
+                    "symbol": symbol,
+                    "reason": "ai_opposite_signal_for_short",
+                    "ai_conf": conf,
+                    "ctx": ctx,
+                    "api_response": resp,
+                })
                 already_closed.add(symbol)
 
-    # Pending trades:
-    # - En auto => ejecuta
-    # - En manual => solo detecta (trigger_detected) y NO ejecuta
+    # Pending trades: en auto ejecuta, en manual solo detecta
     snapshot_data = _get_snapshot_prices()
     try:
-        actions["pending_trades_executed"] = _process_pending_trades(snapshot_data, allow_execute=(exec_mode == "auto"))
+        actions["pending_trades_executed"] = _process_pending_trades(snapshot_data, allow_execute=is_auto)
     except Exception:
         actions["pending_trades_executed"] = []
 
-    # Si hay posiciones, NO hacemos auto-entry (pero ya hicimos cierres/riesgo arriba)
+    # Si NO es auto, ya hicimos risk-management y salimos
+    if not is_auto:
+        return _with_build_id({"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "positions_count": len(positions), "actions": actions})
+
+    # AUTO ENTRY: SOLO si NO hay posiciones
     if len(positions) != 0:
         actions["auto_entry"] = {"status": "skipped", "reason": "positions_exist", "positions_count": len(positions)}
         return _with_build_id({"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "positions_count": len(positions), "actions": actions})
-
-    # Si NO estamos en auto, aquí terminamos (sin entradas)
-    if exec_mode != "auto":
-        actions["auto_entry"] = {"status": "skipped", "reason": "execution_mode_not_auto", "detail": f"execution_mode='{exec_mode}' (no es 'auto')"}
-        return _with_build_id({"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "positions_count": 0, "actions": actions})
 
     if trades_today >= max_trades_per_day:
         actions["auto_entry"] = {"status": "skipped", "reason": "max_trades_per_day_reached", "limits": actions["limits"]}
         return _with_build_id({"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "positions_count": 0, "actions": actions})
 
-    # ✅ Market context + auto entry
+    # ✅ Market context live
     market_data: Dict[str, Any] = {}
     market_ctx_raw: Dict[str, Any] = {}
 
@@ -786,6 +808,7 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
 
     actions["market_ctx"] = market_data if market_data else (market_ctx_raw if market_ctx_raw else {"status": "skipped", "reason": "market_ctx_disabled"})
 
+    # Intento con /signals/ai
     ai_checked_summary: List[Dict[str, Any]] = []
     ai_pick: Optional[Dict[str, Any]] = None
 
