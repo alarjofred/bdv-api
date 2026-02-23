@@ -40,6 +40,11 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _bool_env(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name, "true" if default else "false")
+    return str(raw).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
 AUTO_ENTRY_COOLDOWN_SEC = _env_int("AUTO_ENTRY_COOLDOWN_SEC", 1800)  # 30 min
 AI_TREND_MIN = _env_int("AI_TREND_MIN", 2)  # fallback si market_ctx falla
 AI_MIN_CONFIDENCE = _env_float("AI_MIN_CONFIDENCE", 0.75)
@@ -55,10 +60,12 @@ MARKET_CTX_FEED = os.getenv("APCA_DATA_FEED", "").strip().lower()  # iex/sip (si
 # ✅ Preparado para Paper/Live “on demand”
 DEFAULT_ALPACA_MODE = os.getenv("ALPACA_MODE", "paper").strip().lower()  # paper | live
 
-
-def _bool_env(name: str, default: bool = False) -> bool:
-    raw = os.getenv(name, "true" if default else "false")
-    return str(raw).strip().lower() in ("1", "true", "yes", "y", "on")
+# =====================================================
+# ✅ NUEVO: CIERRE ASISTIDO POR IA (apagado por defecto)
+# =====================================================
+AI_CLOSE_ENABLED = _bool_env("AI_CLOSE_ENABLED", False)
+AI_CLOSE_MIN_CONF = _env_float("AI_CLOSE_MIN_CONF", 0.75)
+AI_CLOSE_TREND_MIN = _env_int("AI_CLOSE_TREND_MIN", 2)
 
 
 def _require_agent_secret(x_bdv_secret: Optional[str]) -> None:
@@ -251,6 +258,8 @@ def _process_pending_trades(snapshot_data: Dict[str, Dict[str, Any]], allow_exec
     now = datetime.utcnow()
     ejecuciones: List[Dict[str, Any]] = []
 
+    # ⚠️ Nota: tu PENDING_TRADES viene de pending_trades.py y ahí es LISTA.
+    # Aquí lo dejé tal cual lo enviaste para no cambiar comportamiento.
     for trade in list(PENDING_TRADES.values()):
         if trade.status != "pending":
             continue
@@ -592,6 +601,11 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
             "market_ctx_limit": MARKET_CTX_LIMIT,
             "market_ctx_lookback_hours": MARKET_CTX_LOOKBACK_HOURS,
             "alpaca_mode": alpaca_mode,
+
+            # ✅ NUEVO (auditable)
+            "ai_close_enabled": AI_CLOSE_ENABLED,
+            "ai_close_min_conf": AI_CLOSE_MIN_CONF,
+            "ai_close_trend_min": AI_CLOSE_TREND_MIN,
         },
         "config_echo": {"execution_mode": exec_mode, "risk_mode": risk_mode},
     }
@@ -666,6 +680,110 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
         elif plpc <= -params["sl_per_trade"]:
             resp = close_symbol_via_api(symbol)
             actions["closed_symbols"].append({"symbol": symbol, "reason": f"Stop loss ({plpc:.2%})", "api_response": resp})
+
+    # =====================================================
+    # ✅ NUEVO: AI CLOSE (solo si hay posiciones)
+    #   - Cierra si IA da señal contraria con confianza alta
+    #   - Usa market_ctx (bias_inferred + trend_strength)
+    #   - Audita en actions["ai_close"]
+    # =====================================================
+    actions["ai_close"] = {"enabled": AI_CLOSE_ENABLED, "attempts": [], "closed": []}
+
+    if AI_CLOSE_ENABLED and positions:
+        # Evita reintentos si ya cerramos algo por TP/SL en este mismo tick
+        already_closed = set([str(x.get("symbol", "")).upper() for x in actions.get("closed_symbols", []) if isinstance(x, dict)])
+
+        pos_symbols = []
+        for p in positions:
+            s = str(p.get("symbol") or "").strip().upper()
+            if s and s not in already_closed:
+                pos_symbols.append(s)
+
+        market_ctx_raw = _get_market_context(pos_symbols) if pos_symbols else {}
+        market_data = {}
+        if isinstance(market_ctx_raw, dict) and isinstance(market_ctx_raw.get("data"), dict):
+            market_data = market_ctx_raw["data"]
+
+        for pos in positions:
+            symbol = str(pos.get("symbol") or "").strip().upper()
+            if not symbol or symbol in already_closed:
+                continue
+
+            # qty >0 long, qty <0 short
+            try:
+                qty_pos = float(pos.get("qty", 0) or 0)
+            except Exception:
+                qty_pos = 0.0
+
+            if qty_pos == 0:
+                continue
+
+            ctx = market_data.get(symbol, {}) if isinstance(market_data, dict) else {}
+            bias = str(ctx.get("bias_inferred", "neutral") or "neutral").strip().lower()
+            if bias not in ("bullish", "bearish", "neutral"):
+                bias = "neutral"
+
+            try:
+                ts = int(ctx.get("trend_strength", 1) or 1)
+            except Exception:
+                ts = 1
+
+            # gate mínimo: sin tendencia suficiente, no cerramos por IA
+            if ts < AI_CLOSE_TREND_MIN:
+                actions["ai_close"]["attempts"].append({
+                    "symbol": symbol,
+                    "skip": f"trend_strength<{AI_CLOSE_TREND_MIN}",
+                    "ctx": ctx,
+                })
+                continue
+
+            ai_payload = _get_signals_ai(symbol, bias=bias, trend_strength=ts)
+            summary = _summarize_ai(ai_payload)
+
+            # extraer acción/conf (de /signals/ai)
+            data = ai_payload.get("data", ai_payload) if isinstance(ai_payload, dict) else {}
+            try:
+                conf = float(data.get("confidence", 0) or 0)
+            except Exception:
+                conf = 0.0
+
+            ai_action = str(data.get("action") or "").strip().lower()
+
+            actions["ai_close"]["attempts"].append({
+                "symbol": symbol,
+                "position_qty": qty_pos,
+                "ctx": ctx,
+                "ai_summary": summary,
+                "ai_action": ai_action,
+                "ai_conf": conf,
+            })
+
+            if conf < AI_CLOSE_MIN_CONF:
+                continue
+
+            # Long + IA dice SELL => cerrar.
+            if qty_pos > 0 and ai_action == "sell":
+                resp = close_symbol_via_api(symbol)
+                actions["ai_close"]["closed"].append({
+                    "symbol": symbol,
+                    "reason": "ai_opposite_signal_for_long",
+                    "ai_conf": conf,
+                    "ctx": ctx,
+                    "api_response": resp,
+                })
+                already_closed.add(symbol)
+
+            # Short + IA dice BUY => cerrar.
+            elif qty_pos < 0 and ai_action == "buy":
+                resp = close_symbol_via_api(symbol)
+                actions["ai_close"]["closed"].append({
+                    "symbol": symbol,
+                    "reason": "ai_opposite_signal_for_short",
+                    "ai_conf": conf,
+                    "ctx": ctx,
+                    "api_response": resp,
+                })
+                already_closed.add(symbol)
 
     # Pending trades SOLO en auto ejecutan
     snapshot_data = _get_snapshot_prices()
