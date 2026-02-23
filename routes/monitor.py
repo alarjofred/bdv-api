@@ -5,7 +5,12 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Dict, Any, List, Optional, Tuple
 
+# ✅ Importa también save_pending_trades si lo tienes en pending_trades.py
 from .pending_trades import PENDING_TRADES
+try:
+    from .pending_trades import save_pending_trades  # opcional
+except Exception:
+    save_pending_trades = None
 
 router = APIRouter(prefix="/monitor", tags=["monitor"])
 
@@ -252,21 +257,22 @@ def _get_snapshot_prices() -> Dict[str, Dict[str, Any]]:
 
 def _process_pending_trades(snapshot_data: Dict[str, Dict[str, Any]], allow_execute: bool) -> List[Dict[str, Any]]:
     """
-    allow_execute=False: solo detecta triggers y marca, NO ejecuta /trade.
-    allow_execute=True: ejecuta /trade.
+    allow_execute=False: solo detecta triggers, NO ejecuta /trade.
+    allow_execute=True: ejecuta /trade y marca triggered.
     """
     now = datetime.utcnow()
     ejecuciones: List[Dict[str, Any]] = []
+    changed = False
 
-    # ⚠️ Nota: tu PENDING_TRADES viene de pending_trades.py y ahí es LISTA.
-    # Aquí lo dejé tal cual lo enviaste para no cambiar comportamiento.
-    for trade in list(PENDING_TRADES.values()):
-        if trade.status != "pending":
+    # ✅ Soporta PENDING_TRADES como LISTA
+    for trade in list(PENDING_TRADES):
+        if getattr(trade, "status", None) != "pending":
             continue
 
-        if trade.valid_until and now > trade.valid_until:
+        valid_until = getattr(trade, "valid_until", None)
+        if valid_until and now > valid_until:
             trade.status = "expired"
-            trade.expired_at = now
+            changed = True
             ejecuciones.append({
                 "id": trade.id,
                 "symbol": trade.symbol,
@@ -292,7 +298,7 @@ def _process_pending_trades(snapshot_data: Dict[str, Dict[str, Any]], allow_exec
         if allow_execute:
             out = _execute_trade_via_http(trade.symbol, trade.side, trade.qty)
             trade.status = "triggered"
-            trade.triggered_at = now
+            changed = True
             ejecuciones.append({
                 "id": trade.id,
                 "symbol": trade.symbol,
@@ -315,6 +321,13 @@ def _process_pending_trades(snapshot_data: Dict[str, Dict[str, Any]], allow_exec
                 "price_at_trigger": price,
                 "status": "trigger_detected",
             })
+
+    # ✅ Persistencia opcional si existe save_pending_trades()
+    if changed and callable(save_pending_trades):
+        try:
+            save_pending_trades(PENDING_TRADES)
+        except Exception:
+            pass
 
     return ejecuciones
 
@@ -379,7 +392,6 @@ def _get_market_context(symbols: List[str]) -> Dict[str, Any]:
         "limit": str(MARKET_CTX_LIMIT),
         "lookback_hours": str(MARKET_CTX_LOOKBACK_HOURS),
     }
-    # feed opcional (si está configurado). si no, snapshot.py usa su default seguro
     if MARKET_CTX_FEED in ("iex", "sip"):
         params["feed"] = MARKET_CTX_FEED
 
@@ -394,11 +406,6 @@ def _get_market_context(symbols: List[str]) -> Dict[str, Any]:
 
 
 def _market_gate_allows(ctx: Dict[str, Any], side: str) -> Tuple[bool, str]:
-    """
-    Reglas simples (tu “dual support”):
-      - si trend_strength < MARKET_TREND_MIN => NO auto-entry
-      - si bias fuerte contradice el side => NO auto-entry
-    """
     if not MARKET_CTX_ENABLED:
         return True, "market_ctx_disabled"
 
@@ -424,10 +431,6 @@ def _market_gate_allows(ctx: Dict[str, Any], side: str) -> Tuple[bool, str]:
 
 
 def _get_signals_ai(symbol: str, bias: str, trend_strength: int) -> Dict[str, Any]:
-    """
-    Llama a /signals/ai usando bias+trend_strength inferidos del mercado (live).
-    Si market_ctx falla, caller puede pasar fallback neutral/AI_TREND_MIN.
-    """
     if not API_BASE:
         return {}
 
@@ -500,9 +503,6 @@ def _pick_trade_from_signals_ai(ai_payload: Dict[str, Any], min_conf: float) -> 
 
 
 def _summarize_ai(ai_payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    ✅ kind="none" NO debe marcarse como opciones
-    """
     if not isinstance(ai_payload, dict):
         return {"status": "bad_ai_payload"}
 
@@ -532,9 +532,6 @@ def _cooldown_key(symbol: str, side: str) -> str:
 
 
 def _cooldown_state(symbol: str, side: str) -> Dict[str, Any]:
-    """
-    Cooldown por símbolo+side (per_symbol_and_side).
-    """
     now = datetime.utcnow()
     key = _cooldown_key(symbol, side)
 
@@ -601,8 +598,6 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
             "market_ctx_limit": MARKET_CTX_LIMIT,
             "market_ctx_lookback_hours": MARKET_CTX_LOOKBACK_HOURS,
             "alpaca_mode": alpaca_mode,
-
-            # ✅ NUEVO (auditable)
             "ai_close_enabled": AI_CLOSE_ENABLED,
             "ai_close_min_conf": AI_CLOSE_MIN_CONF,
             "ai_close_trend_min": AI_CLOSE_TREND_MIN,
@@ -610,13 +605,8 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
         "config_echo": {"execution_mode": exec_mode, "risk_mode": risk_mode},
     }
 
-    if exec_mode != "auto":
-        actions["auto_entry"] = {
-            "status": "skipped",
-            "reason": "execution_mode_not_auto",
-            "detail": f"execution_mode='{exec_mode}' (no es 'auto')",
-        }
-        return _with_build_id({"status": "skipped", "reason": actions["auto_entry"]["detail"], "actions": actions})
+    # ✅ Importante: ahora NO salimos si exec_mode=manual
+    # Manual solo bloquea ENTRADAS; cierres/riesgo siguen funcionando.
 
     account, positions = get_account_and_positions()
     equity = float(account.get("equity", 0.0))
@@ -644,53 +634,46 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
         actions["closed_all"] = True
         actions["reason_all"] = "Hora límite 15:45 NY"
         actions["close_all_response"] = result
-        actions["auto_entry"] = {"status": "skipped", "reason": "positions_exist_close_logic"}
-        return _with_build_id({"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "positions_count": len(positions), "actions": actions})
 
-    if positions and pnl_today >= daily_target_abs:
+    if positions and (not actions["closed_all"]) and pnl_today >= daily_target_abs:
         result = close_all_via_api()
         actions["closed_all"] = True
         actions["reason_all"] = "Meta diaria alcanzada"
         actions["close_all_response"] = result
-        actions["auto_entry"] = {"status": "skipped", "reason": "positions_exist_daily_target"}
-        return _with_build_id({"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "positions_count": len(positions), "actions": actions})
 
-    if positions and pnl_today <= daily_max_loss_abs:
+    if positions and (not actions["closed_all"]) and pnl_today <= daily_max_loss_abs:
         result = close_all_via_api()
         actions["closed_all"] = True
         actions["reason_all"] = "Pérdida diaria máxima alcanzada"
         actions["close_all_response"] = result
-        actions["auto_entry"] = {"status": "skipped", "reason": "positions_exist_daily_max_loss"}
-        return _with_build_id({"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "positions_count": len(positions), "actions": actions})
 
-    # TP/SL por posición
-    for pos in positions:
-        symbol = pos.get("symbol")
-        if not symbol:
-            continue
+    # TP/SL por posición (si no cerramos todo)
+    if positions and not actions["closed_all"]:
+        for pos in positions:
+            symbol = pos.get("symbol")
+            if not symbol:
+                continue
 
-        try:
-            plpc = float(pos.get("unrealized_plpc", 0.0))
-        except (TypeError, ValueError):
-            plpc = 0.0
+            try:
+                plpc = float(pos.get("unrealized_plpc", 0.0))
+            except (TypeError, ValueError):
+                plpc = 0.0
 
-        if plpc >= params["tp_per_trade"]:
-            resp = close_symbol_via_api(symbol)
-            actions["closed_symbols"].append({"symbol": symbol, "reason": f"Take profit ({plpc:.2%})", "api_response": resp})
-        elif plpc <= -params["sl_per_trade"]:
-            resp = close_symbol_via_api(symbol)
-            actions["closed_symbols"].append({"symbol": symbol, "reason": f"Stop loss ({plpc:.2%})", "api_response": resp})
+            if plpc >= params["tp_per_trade"]:
+                resp = close_symbol_via_api(symbol)
+                actions["closed_symbols"].append({"symbol": symbol, "reason": f"Take profit ({plpc:.2%})", "api_response": resp})
+            elif plpc <= -params["sl_per_trade"]:
+                resp = close_symbol_via_api(symbol)
+                actions["closed_symbols"].append({"symbol": symbol, "reason": f"Stop loss ({plpc:.2%})", "api_response": resp})
 
     # =====================================================
-    # ✅ NUEVO: AI CLOSE (solo si hay posiciones)
+    # ✅ AI CLOSE (solo si hay posiciones y está habilitado)
     #   - Cierra si IA da señal contraria con confianza alta
-    #   - Usa market_ctx (bias_inferred + trend_strength)
     #   - Audita en actions["ai_close"]
     # =====================================================
     actions["ai_close"] = {"enabled": AI_CLOSE_ENABLED, "attempts": [], "closed": []}
 
-    if AI_CLOSE_ENABLED and positions:
-        # Evita reintentos si ya cerramos algo por TP/SL en este mismo tick
+    if AI_CLOSE_ENABLED and positions and not actions["closed_all"]:
         already_closed = set([str(x.get("symbol", "")).upper() for x in actions.get("closed_symbols", []) if isinstance(x, dict)])
 
         pos_symbols = []
@@ -709,7 +692,6 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
             if not symbol or symbol in already_closed:
                 continue
 
-            # qty >0 long, qty <0 short
             try:
                 qty_pos = float(pos.get("qty", 0) or 0)
             except Exception:
@@ -728,20 +710,14 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
             except Exception:
                 ts = 1
 
-            # gate mínimo: sin tendencia suficiente, no cerramos por IA
             if ts < AI_CLOSE_TREND_MIN:
-                actions["ai_close"]["attempts"].append({
-                    "symbol": symbol,
-                    "skip": f"trend_strength<{AI_CLOSE_TREND_MIN}",
-                    "ctx": ctx,
-                })
+                actions["ai_close"]["attempts"].append({"symbol": symbol, "skip": f"trend_strength<{AI_CLOSE_TREND_MIN}", "ctx": ctx})
                 continue
 
             ai_payload = _get_signals_ai(symbol, bias=bias, trend_strength=ts)
             summary = _summarize_ai(ai_payload)
-
-            # extraer acción/conf (de /signals/ai)
             data = ai_payload.get("data", ai_payload) if isinstance(ai_payload, dict) else {}
+
             try:
                 conf = float(data.get("confidence", 0) or 0)
             except Exception:
@@ -761,47 +737,42 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
             if conf < AI_CLOSE_MIN_CONF:
                 continue
 
-            # Long + IA dice SELL => cerrar.
+            # Long + IA dice SELL => cerrar
             if qty_pos > 0 and ai_action == "sell":
                 resp = close_symbol_via_api(symbol)
-                actions["ai_close"]["closed"].append({
-                    "symbol": symbol,
-                    "reason": "ai_opposite_signal_for_long",
-                    "ai_conf": conf,
-                    "ctx": ctx,
-                    "api_response": resp,
-                })
+                actions["ai_close"]["closed"].append({"symbol": symbol, "reason": "ai_opposite_signal_for_long", "ai_conf": conf, "ctx": ctx, "api_response": resp})
                 already_closed.add(symbol)
 
-            # Short + IA dice BUY => cerrar.
+            # Short + IA dice BUY => cerrar
             elif qty_pos < 0 and ai_action == "buy":
                 resp = close_symbol_via_api(symbol)
-                actions["ai_close"]["closed"].append({
-                    "symbol": symbol,
-                    "reason": "ai_opposite_signal_for_short",
-                    "ai_conf": conf,
-                    "ctx": ctx,
-                    "api_response": resp,
-                })
+                actions["ai_close"]["closed"].append({"symbol": symbol, "reason": "ai_opposite_signal_for_short", "ai_conf": conf, "ctx": ctx, "api_response": resp})
                 already_closed.add(symbol)
 
-    # Pending trades SOLO en auto ejecutan
+    # Pending trades:
+    # - En auto => ejecuta
+    # - En manual => solo detecta (trigger_detected) y NO ejecuta
     snapshot_data = _get_snapshot_prices()
     try:
-        actions["pending_trades_executed"] = _process_pending_trades(snapshot_data, allow_execute=True)
+        actions["pending_trades_executed"] = _process_pending_trades(snapshot_data, allow_execute=(exec_mode == "auto"))
     except Exception:
         actions["pending_trades_executed"] = []
 
-    # AUTO ENTRY: SOLO si NO hay posiciones
+    # Si hay posiciones, NO hacemos auto-entry (pero ya hicimos cierres/riesgo arriba)
     if len(positions) != 0:
         actions["auto_entry"] = {"status": "skipped", "reason": "positions_exist", "positions_count": len(positions)}
         return _with_build_id({"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "positions_count": len(positions), "actions": actions})
+
+    # Si NO estamos en auto, aquí terminamos (sin entradas)
+    if exec_mode != "auto":
+        actions["auto_entry"] = {"status": "skipped", "reason": "execution_mode_not_auto", "detail": f"execution_mode='{exec_mode}' (no es 'auto')"}
+        return _with_build_id({"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "positions_count": 0, "actions": actions})
 
     if trades_today >= max_trades_per_day:
         actions["auto_entry"] = {"status": "skipped", "reason": "max_trades_per_day_reached", "limits": actions["limits"]}
         return _with_build_id({"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "positions_count": 0, "actions": actions})
 
-    # ✅ PASO 2: leer contexto live (bias + trend_strength)
+    # ✅ Market context + auto entry
     market_data: Dict[str, Any] = {}
     market_ctx_raw: Dict[str, Any] = {}
 
@@ -815,7 +786,6 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
 
     actions["market_ctx"] = market_data if market_data else (market_ctx_raw if market_ctx_raw else {"status": "skipped", "reason": "market_ctx_disabled"})
 
-    # Intento con /signals/ai
     ai_checked_summary: List[Dict[str, Any]] = []
     ai_pick: Optional[Dict[str, Any]] = None
 
@@ -831,7 +801,6 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
         except Exception:
             ts = 1
 
-        # fallback si market_ctx no trajo datos
         if not ctx:
             ts = AI_TREND_MIN if AI_TREND_MIN else 1
 
@@ -844,17 +813,14 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
             continue
 
         if isinstance(pick, dict) and pick.get("symbol") and pick.get("side") and pick.get("source") == "signals_ai":
-            # ✅ GATE FINAL por market_ctx (dual support)
             if MARKET_CTX_ENABLED:
                 ctx_for_pick = market_data.get(pick["symbol"], {}) if isinstance(market_data, dict) else {}
                 allow_gate, gate_reason = _market_gate_allows(ctx_for_pick if isinstance(ctx_for_pick, dict) else {}, pick["side"])
                 pick["market_gate"] = {"allow": allow_gate, "reason": gate_reason, "ctx": ctx_for_pick}
                 if not allow_gate:
-                    # no tomamos este trade, seguimos buscando otro símbolo
                     ai_checked_summary[-1]["market_gate_blocked"] = pick["market_gate"]
                     continue
 
-            # trazabilidad del contexto usado
             pick["bias_used"] = bias
             pick["trend_strength_used"] = ts
             ai_pick = pick
@@ -917,7 +883,6 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
         }
         return _with_build_id({"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "positions_count": 0, "actions": actions})
 
-    # ✅ GATE también para recommend si lo habilitas
     if MARKET_CTX_ENABLED:
         ctx_for_pick = market_data.get(pick["symbol"], {}) if isinstance(market_data, dict) else {}
         allow_gate, gate_reason = _market_gate_allows(ctx_for_pick if isinstance(ctx_for_pick, dict) else {}, pick["side"])
