@@ -16,12 +16,13 @@ APCA_API_SECRET_KEY = os.getenv("APCA_API_SECRET_KEY")
 
 BUILD_ID = os.getenv("BUILD_ID", "unknown")
 
+
 def _normalize_data_url_v2(raw: str) -> str:
     raw = (raw or "https://data.alpaca.markets").strip().rstrip("/")
-    # Queremos que termine EXACTAMENTE en /v2
     if raw.endswith("/v2"):
         return raw
     return raw + "/v2"
+
 
 APCA_DATA_URL = _normalize_data_url_v2(os.getenv("APCA_DATA_URL", "https://data.alpaca.markets"))
 
@@ -29,9 +30,8 @@ APCA_DATA_URL = _normalize_data_url_v2(os.getenv("APCA_DATA_URL", "https://data.
 _raw_trading = os.getenv("APCA_TRADING_URL", "https://paper-api.alpaca.markets").rstrip("/")
 APCA_TRADING_URL = _raw_trading if _raw_trading.endswith("/v2") else f"{_raw_trading}/v2"
 
-# ✅ DISCO PERSISTENTE (Render Disk)
-# En tus envs aparece BDV_PERSIST_DIR, así que lo priorizamos.
-PERSIST_DIR = os.getenv("BDV_PERSIST_DIR") or os.getenv("PERSIST_DIR") or "/data"
+# ✅ DISCO PERSISTENTE (Render Disk) — ALINEADO con routes/config.py
+PERSIST_DIR = (os.getenv("BDV_PERSIST_DIR", "/var/data") or "/var/data").strip()
 os.makedirs(PERSIST_DIR, exist_ok=True)
 TRADES_LOG_FILE = os.path.join(PERSIST_DIR, "trades-log.jsonl")
 
@@ -41,7 +41,6 @@ def has_alpaca_keys() -> bool:
 
 
 def alpaca_headers() -> dict:
-    """Headers básicos para cualquier llamada a Alpaca."""
     if not has_alpaca_keys():
         raise HTTPException(
             status_code=500,
@@ -155,10 +154,6 @@ if candles is not None:
 # Función auxiliar: última cotización (bid/ask)
 # ---------------------------------
 def get_latest_quote(symbol: str) -> dict:
-    """
-    Alpaca:
-    /v2/stocks/{symbol}/quotes/latest -> {"quote": {...}}
-    """
     url = f"{APCA_DATA_URL}/stocks/{symbol}/quotes/latest"
     r = requests.get(url, headers=alpaca_headers(), timeout=10)
     r.raise_for_status()
@@ -170,9 +165,6 @@ def get_latest_quote(symbol: str) -> dict:
 # ---------------------------------
 @app.get("/snapshot")
 def market_snapshot():
-    """
-    Devuelve último precio (ask) y hora de QQQ, SPY y NVDA (usando quotes).
-    """
     if not has_alpaca_keys():
         raise HTTPException(status_code=500, detail="Faltan keys de Alpaca para /snapshot.")
 
