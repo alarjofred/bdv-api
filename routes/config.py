@@ -30,13 +30,35 @@ MAX_TRADES_BY_RISK = {
 
 
 class ConfigStatus(BaseModel):
-    execution_mode: ExecutionMode = ExecutionMode.manual
-    risk_mode: RiskMode = RiskMode.low
-    max_trades_per_day: int = 1
+    # ✅ Defaults “operativos” (para que deploy no te pase a manual/low)
+    execution_mode: ExecutionMode = ExecutionMode.auto
+    risk_mode: RiskMode = RiskMode.medium
+    max_trades_per_day: int = 3
     trades_today: int = 0
 
 
-config_state = ConfigStatus()
+def _safe_enum(enum_cls, value: Any, default):
+    try:
+        s = str(value).strip().lower()
+        return enum_cls(s)
+    except Exception:
+        return default
+
+
+def _default_execution_mode() -> ExecutionMode:
+    env_val = os.getenv("BDV_DEFAULT_EXECUTION_MODE", "auto")
+    return _safe_enum(ExecutionMode, env_val, ExecutionMode.auto)
+
+
+def _default_risk_mode() -> RiskMode:
+    env_val = os.getenv("BDV_DEFAULT_RISK_MODE", "medium")
+    return _safe_enum(RiskMode, env_val, RiskMode.medium)
+
+
+config_state = ConfigStatus(
+    execution_mode=_default_execution_mode(),
+    risk_mode=_default_risk_mode(),
+)
 
 
 def _sync_max_trades() -> None:
@@ -54,7 +76,6 @@ api_key_header = APIKeyHeader(name="X-BDV-SECRET", auto_error=False)
 
 
 def _get_agent_secret() -> str:
-    # leer siempre del env
     return os.getenv("BDV_AGENT_SECRET", "").strip()
 
 
@@ -72,17 +93,10 @@ def _require_secret(api_key: Optional[str]) -> None:
 # =========================
 # Persistencia en Disk (Render)
 # =========================
+# ✅ Alineado con main.py: usar BDV_PERSIST_DIR como fuente principal.
 PERSIST_DIR = (os.getenv("BDV_PERSIST_DIR", "/var/data") or "/var/data").strip()
 CONFIG_FILE = (os.getenv("BDV_CONFIG_FILE", "bdv_config.json") or "bdv_config.json").strip()
 CONFIG_PATH = Path(PERSIST_DIR) / CONFIG_FILE
-
-
-def _safe_enum(enum_cls, value: Any, default):
-    try:
-        s = str(value).strip().lower()
-        return enum_cls(s)
-    except Exception:
-        return default
 
 
 def _load_config_from_disk() -> None:
@@ -141,7 +155,7 @@ async def _extract_mode(
         if m in allowed:
             return m
 
-    # 2) Body ya parseado (dict / str)
+    # 2) Body ya parseado
     if isinstance(body_obj, dict):
         v = body_obj.get(primary_key) or body_obj.get(alt_key)
         if v is not None:
@@ -159,13 +173,11 @@ async def _extract_mode(
     if raw:
         text = raw.decode("utf-8", errors="ignore").strip()
 
-        # raw: auto
         if text and not text.startswith("{") and not text.startswith("["):
             m = _norm(text.strip('"').strip("'"))
             if m in allowed:
                 return m
 
-        # JSON dict o JSON string
         try:
             parsed = json.loads(text)
             if isinstance(parsed, dict):
