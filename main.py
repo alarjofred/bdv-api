@@ -3,7 +3,6 @@ from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
 import os
 import requests
-from datetime import datetime
 import json
 
 # ---------------------------------
