@@ -29,14 +29,6 @@ MAX_TRADES_BY_RISK = {
 }
 
 
-class ConfigStatus(BaseModel):
-    # ✅ Defaults “operativos” (para que deploy no te pase a manual/low)
-    execution_mode: ExecutionMode = ExecutionMode.auto
-    risk_mode: RiskMode = RiskMode.medium
-    max_trades_per_day: int = 3
-    trades_today: int = 0
-
-
 def _safe_enum(enum_cls, value: Any, default):
     try:
         s = str(value).strip().lower()
@@ -45,20 +37,22 @@ def _safe_enum(enum_cls, value: Any, default):
         return default
 
 
-def _default_execution_mode() -> ExecutionMode:
-    env_val = os.getenv("BDV_DEFAULT_EXECUTION_MODE", "auto")
-    return _safe_enum(ExecutionMode, env_val, ExecutionMode.auto)
+# ✅ Defaults de BOOT (solo si NO hay config en disco)
+DEFAULT_EXECUTION_MODE = os.getenv("BDV_DEFAULT_EXECUTION_MODE", "auto").strip().lower()
+DEFAULT_RISK_MODE = os.getenv("BDV_DEFAULT_RISK_MODE", "medium").strip().lower()
+
+BOOT_EXEC = _safe_enum(ExecutionMode, DEFAULT_EXECUTION_MODE, ExecutionMode.manual)
+BOOT_RISK = _safe_enum(RiskMode, DEFAULT_RISK_MODE, RiskMode.low)
 
 
-def _default_risk_mode() -> RiskMode:
-    env_val = os.getenv("BDV_DEFAULT_RISK_MODE", "medium")
-    return _safe_enum(RiskMode, env_val, RiskMode.medium)
+class ConfigStatus(BaseModel):
+    execution_mode: ExecutionMode = BOOT_EXEC
+    risk_mode: RiskMode = BOOT_RISK
+    max_trades_per_day: int = 1
+    trades_today: int = 0
 
 
-config_state = ConfigStatus(
-    execution_mode=_default_execution_mode(),
-    risk_mode=_default_risk_mode(),
-)
+config_state = ConfigStatus()
 
 
 def _sync_max_trades() -> None:
@@ -80,9 +74,6 @@ def _get_agent_secret() -> str:
 
 
 def _require_secret(api_key: Optional[str]) -> None:
-    """
-    Si BDV_AGENT_SECRET está definido, exige header X-BDV-SECRET en endpoints POST.
-    """
     expected = _get_agent_secret()
     if expected:
         got = (api_key or "").strip()
@@ -93,13 +84,17 @@ def _require_secret(api_key: Optional[str]) -> None:
 # =========================
 # Persistencia en Disk (Render)
 # =========================
-# ✅ Alineado con main.py: usar BDV_PERSIST_DIR como fuente principal.
+# ✅ Usa el mismo env que ya tienes
 PERSIST_DIR = (os.getenv("BDV_PERSIST_DIR", "/var/data") or "/var/data").strip()
 CONFIG_FILE = (os.getenv("BDV_CONFIG_FILE", "bdv_config.json") or "bdv_config.json").strip()
 CONFIG_PATH = Path(PERSIST_DIR) / CONFIG_FILE
 
 
 def _load_config_from_disk() -> None:
+    """
+    Si existe config en disco, manda.
+    Si no existe, se queda con BOOT defaults (auto/medium por env).
+    """
     try:
         if CONFIG_PATH.exists():
             raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
@@ -149,13 +144,11 @@ async def _extract_mode(
     alt_key: str,
     allowed: Set[str],
 ) -> str:
-    # 1) Querystring
     if query_mode:
         m = _norm(str(query_mode))
         if m in allowed:
             return m
 
-    # 2) Body ya parseado
     if isinstance(body_obj, dict):
         v = body_obj.get(primary_key) or body_obj.get(alt_key)
         if v is not None:
@@ -168,7 +161,6 @@ async def _extract_mode(
         if m in allowed:
             return m
 
-    # 3) Raw body fallback
     raw = await request.body()
     if raw:
         text = raw.decode("utf-8", errors="ignore").strip()
