@@ -29,6 +29,16 @@ MAX_TRADES_BY_RISK = {
 }
 
 
+class ConfigStatus(BaseModel):
+    execution_mode: ExecutionMode = ExecutionMode.manual
+    risk_mode: RiskMode = RiskMode.low
+    max_trades_per_day: int = 1
+    trades_today: int = 0
+
+
+# =========================
+# Defaults “anti-deploy reset”
+# =========================
 def _safe_enum(enum_cls, value: Any, default):
     try:
         s = str(value).strip().lower()
@@ -37,22 +47,15 @@ def _safe_enum(enum_cls, value: Any, default):
         return default
 
 
-# ✅ Defaults de BOOT (solo si NO hay config en disco)
-DEFAULT_EXECUTION_MODE = os.getenv("BDV_DEFAULT_EXECUTION_MODE", "auto").strip().lower()
-DEFAULT_RISK_MODE = os.getenv("BDV_DEFAULT_RISK_MODE", "medium").strip().lower()
+DEFAULT_EXEC = os.getenv("BDV_DEFAULT_EXECUTION_MODE", "auto").strip().lower()
+DEFAULT_RISK = os.getenv("BDV_DEFAULT_RISK_MODE", "medium").strip().lower()
 
-BOOT_EXEC = _safe_enum(ExecutionMode, DEFAULT_EXECUTION_MODE, ExecutionMode.manual)
-BOOT_RISK = _safe_enum(RiskMode, DEFAULT_RISK_MODE, RiskMode.low)
-
-
-class ConfigStatus(BaseModel):
-    execution_mode: ExecutionMode = BOOT_EXEC
-    risk_mode: RiskMode = BOOT_RISK
-    max_trades_per_day: int = 1
-    trades_today: int = 0
-
-
-config_state = ConfigStatus()
+config_state = ConfigStatus(
+    execution_mode=_safe_enum(ExecutionMode, DEFAULT_EXEC, ExecutionMode.auto),
+    risk_mode=_safe_enum(RiskMode, DEFAULT_RISK, RiskMode.medium),
+    max_trades_per_day=1,
+    trades_today=0,
+)
 
 
 def _sync_max_trades() -> None:
@@ -84,19 +87,16 @@ def _require_secret(api_key: Optional[str]) -> None:
 # =========================
 # Persistencia en Disk (Render)
 # =========================
-# ✅ Usa el mismo env que ya tienes
 PERSIST_DIR = (os.getenv("BDV_PERSIST_DIR", "/var/data") or "/var/data").strip()
 CONFIG_FILE = (os.getenv("BDV_CONFIG_FILE", "bdv_config.json") or "bdv_config.json").strip()
 CONFIG_PATH = Path(PERSIST_DIR) / CONFIG_FILE
 
 
 def _load_config_from_disk() -> None:
-    """
-    Si existe config en disco, manda.
-    Si no existe, se queda con BOOT defaults (auto/medium por env).
-    """
+    exists = False
     try:
         if CONFIG_PATH.exists():
+            exists = True
             raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
             if isinstance(raw, dict):
                 if "execution_mode" in raw:
@@ -116,6 +116,9 @@ def _load_config_from_disk() -> None:
         pass
     finally:
         _sync_max_trades()
+        # Si no existía archivo, lo creamos con defaults para que deploy no resetee
+        if not exists:
+            _save_config_to_disk()
 
 
 def _save_config_to_disk() -> None:
