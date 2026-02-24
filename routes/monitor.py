@@ -1,40 +1,57 @@
+from fastapi import APIRouter, HTTPException, Header
 import os
-import json
 import requests
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from typing import Any, Dict, Optional, List
-from fastapi import APIRouter, Header, HTTPException, Query
+from typing import Dict, Any, List, Optional, Tuple
 
-from .telegram_notify import send_alert
+from .pending_trades import PENDING_TRADES
 
-router = APIRouter(prefix="/agent", tags=["agent"])
+router = APIRouter(prefix="/monitor", tags=["monitor"])
 
 API_BASE = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+
+_raw_trading = os.getenv("APCA_TRADING_URL", "https://paper-api.alpaca.markets").rstrip("/")
+TRADING_URL = _raw_trading[:-3] if _raw_trading.endswith("/v2") else _raw_trading
+
 BDV_AGENT_SECRET = os.getenv("BDV_AGENT_SECRET", "").strip()
+BUILD_ID = os.getenv("BUILD_ID", "unknown")
 
-# OpenAI (panel experto)
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1")
-OPENAI_ENABLED = os.getenv("OPENAI_ENABLED", "0").strip().lower() in ("1", "true", "yes", "y", "on")
+_LAST_ENTRY_BY_KEY: Dict[str, datetime] = {}
 
-# Símbolos y Telegram
-AGENT_SYMBOLS = os.getenv("AGENT_SYMBOLS", "QQQ,SPY,NVDA")
-AGENT_SEND_TELEGRAM = os.getenv("AGENT_SEND_TELEGRAM", "1").strip().lower() not in ("0", "false", "no")
 
-# ✅ Orquestación (encendida por defecto)
-AGENT_DECISION_ENABLED = os.getenv("AGENT_DECISION_ENABLED", "1").strip().lower() in ("1", "true", "yes", "y", "on")
-AGENT_DECISION_TTL_SEC = int(os.getenv("AGENT_DECISION_TTL_SEC", "120"))
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(str(os.getenv(name, str(default))).strip())
+    except Exception:
+        return default
 
-# ✅ Regla por tiers (la que pediste)
-AGENT_TIER1_CONF = float(os.getenv("AGENT_TIER1_CONF", "0.75"))
-AGENT_TIER2_MIN_CONF = float(os.getenv("AGENT_TIER2_MIN_CONF", "0.66"))
-AGENT_TIER2_MIN_TREND = int(os.getenv("AGENT_TIER2_MIN_TREND", "3"))
 
-# Semáforo (opcional para scan)
-AGENT_STALE_GREEN_MAX_SEC = int(os.getenv("AGENT_STALE_GREEN_MAX_SEC", "120"))
-AGENT_STALE_YELLOW_MAX_SEC = int(os.getenv("AGENT_STALE_YELLOW_MAX_SEC", "600"))
-AGENT_ALLOW_YELLOW_SUMMARY = os.getenv("AGENT_ALLOW_YELLOW_SUMMARY", "1").strip().lower() in ("1", "true", "yes", "y", "on")
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(str(os.getenv(name, str(default))).strip())
+    except Exception:
+        return default
+
+
+def _bool_env(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name, "true" if default else "false")
+    return str(raw).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+AUTO_ENTRY_COOLDOWN_SEC = _env_int("AUTO_ENTRY_COOLDOWN_SEC", 1800)
+
+# Orquestación
+ORCH_ENABLED = _bool_env("ORCH_ENABLED", True)
+ORCH_DECISION_ENDPOINT = os.getenv("ORCH_DECISION_ENDPOINT", "/agent/decision").strip() or "/agent/decision"
+
+# ✅ Máximo de posiciones abiertas simultáneamente
+# 0 => usa max_trades_per_day del config (medium=3)
+MAX_OPEN_POSITIONS = _env_int("MAX_OPEN_POSITIONS", 0)
+
+# EOD close window (para permitir cierre aunque tick llegue tarde)
+EOD_CLOSE_ENABLED = _bool_env("EOD_CLOSE_ENABLED", True)
+EOD_CLOSE_HHMM = _env_int("EOD_CLOSE_HHMM", 1545)  # 15:45 ET
 
 
 def _require_agent_secret(x_bdv_secret: Optional[str]) -> None:
@@ -50,329 +67,448 @@ def _api_headers() -> Dict[str, str]:
     return h
 
 
-def _get_json(url: str, timeout: int = 10) -> Dict[str, Any]:
-    r = requests.get(url, headers=_api_headers(), timeout=timeout)
-    r.raise_for_status()
-    data = r.json()
-    return data.get("data", data)
+def _with_build_id(payload: Dict[str, Any]) -> Dict[str, Any]:
+    payload["build_id"] = BUILD_ID
+    return payload
 
 
-def _parse_snapshot_time_et(snapshot: Dict[str, Any]) -> Optional[datetime]:
-    t = snapshot.get("time") or snapshot.get("timestamp")
-    if not t and isinstance(snapshot, dict):
-        for _, v in snapshot.items():
-            if isinstance(v, dict) and (v.get("time") or v.get("timestamp")):
-                t = v.get("time") or v.get("timestamp")
-                break
-    if not t:
-        return None
+def _safe_json(resp: requests.Response) -> Any:
     try:
-        s = str(t).replace("Z", "+00:00")
-        dt_utc = datetime.fromisoformat(s)
-        if dt_utc.tzinfo is None:
-            dt_utc = dt_utc.replace(tzinfo=ZoneInfo("UTC"))
-        return dt_utc.astimezone(ZoneInfo("America/New_York"))
+        return resp.json()
     except Exception:
-        return None
+        return {"status": "error", "http": resp.status_code, "body": resp.text}
 
 
-def _call_openai(prompt: str) -> str:
-    if not OPENAI_API_KEY:
-        return ""
-
-    url = "https://api.openai.com/v1/responses"
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    body = {"model": OPENAI_MODEL, "input": prompt}
-
-    r = requests.post(url, headers=headers, json=body, timeout=35)
-    r.raise_for_status()
-    j = r.json()
-
-    if isinstance(j, dict) and j.get("output_text"):
-        return str(j["output_text"]).strip()
-
-    out = j.get("output", [])
-    chunks: List[str] = []
-    for item in out if isinstance(out, list) else []:
-        if not isinstance(item, dict):
-            continue
-        content = item.get("content", [])
-        if not isinstance(content, list):
-            continue
-        for c in content:
-            if isinstance(c, dict) and c.get("type") in ("output_text", "text") and "text" in c:
-                chunks.append(str(c["text"]))
-    return "\n".join(chunks).strip()
-
-
-def _try_parse_json(text: str) -> Optional[Dict[str, Any]]:
-    if not text:
-        return None
-    text = text.strip()
-
-    try:
-        obj = json.loads(text)
-        return obj if isinstance(obj, dict) else None
-    except Exception:
-        pass
-
-    try:
-        start = text.find("{")
-        end = text.rfind("}")
-        if start >= 0 and end > start:
-            obj = json.loads(text[start : end + 1])
-            return obj if isinstance(obj, dict) else None
-    except Exception:
-        pass
-
-    return None
-
-
-def _send_signal_telegram(symbols: List[str], title: str, note: str):
-    if not AGENT_SEND_TELEGRAM:
-        return
-    send_alert(
-        "signal",
-        {
-            "symbol": ",".join(symbols) if symbols else "BDV",
-            "bias": "neutral",
-            "suggestion": title,
-            "target": "",
-            "stop": "",
-            "note": (note or "")[:3500],
-        },
-    )
-
-
-def _get_signals_ai(symbol: str, bias: str, trend_strength: int) -> Dict[str, Any]:
-    params = {
-        "symbol": symbol,
-        "bias": bias,
-        "trend_strength": int(trend_strength),
-        "near_extreme": "false",
-        "prefer_spreads": "true",
-    }
-    r = requests.get(f"{API_BASE}/signals/ai", headers=_api_headers(), params=params, timeout=12)
-    if r.status_code != 200:
-        return {"status": "error", "http": r.status_code, "body": r.text, "params": params}
-    data = r.json()
-    return data if isinstance(data, dict) else {"status": "error", "detail": "signals_ai_non_dict", "params": params}
-
-
-def _summarize_candidate(symbol: str, ctx: Dict[str, Any], ai_payload: Dict[str, Any]) -> Dict[str, Any]:
-    data = ai_payload.get("data", ai_payload) if isinstance(ai_payload, dict) else {}
-    action = str((data.get("action") or "")).strip().lower()
-    try:
-        conf = float(data.get("confidence", 0) or 0)
-    except Exception:
-        conf = 0.0
-    try:
-        ts = int(ctx.get("trend_strength", 2) or 2)
-    except Exception:
-        ts = 2
-
+def get_alpaca_headers() -> Dict[str, str]:
+    api_key = os.getenv("APCA_API_KEY_ID")
+    api_secret = os.getenv("APCA_API_SECRET_KEY")
+    if not api_key or not api_secret:
+        raise HTTPException(status_code=500, detail="Faltan APCA_API_KEY_ID o APCA_API_SECRET_KEY")
     return {
-        "symbol": symbol,
-        "bias": str(ctx.get("bias_inferred", "neutral")),
-        "trend_strength": ts,
-        "action": action,
-        "confidence": conf,
+        "APCA-API-KEY-ID": api_key,
+        "APCA-API-SECRET-KEY": api_secret,
+        "Accept": "application/json",
     }
 
 
-def _passes_tier_rule(conf: float, trend_strength: int) -> bool:
-    if conf >= AGENT_TIER1_CONF:
-        return True
-    if conf >= AGENT_TIER2_MIN_CONF and trend_strength >= AGENT_TIER2_MIN_TREND:
-        return True
-    return False
-
-
-@router.get("/decision")
-def agent_decision(
-    x_bdv_secret: Optional[str] = Header(default=None),
-):
-    """
-    ✅ Fuente de verdad para ejecución:
-    - /monitor/tick llama aquí
-    - /agent/scan reporta lo mismo
-    """
-    _require_agent_secret(x_bdv_secret)
-
+def get_config_status() -> Dict[str, Any]:
     if not API_BASE:
-        raise HTTPException(status_code=500, detail="RENDER_EXTERNAL_URL no definido")
-
-    if not AGENT_DECISION_ENABLED:
-        return {"status": "ok", "decision": "no_trade", "why": "AGENT_DECISION_ENABLED=false"}
-
-    # 1) config + snapshot (para contexto y auditoría)
-    cfg = _get_json(f"{API_BASE}/config/status", timeout=8)
-    snap = _get_json(f"{API_BASE}/snapshot", timeout=8)
-    snap_time_et = _parse_snapshot_time_et(snap if isinstance(snap, dict) else {})
-
-    symbols = [s.strip().upper() for s in AGENT_SYMBOLS.split(",") if s.strip()]
-    if not symbols:
-        symbols = ["QQQ"]
-
-    # 2) market_ctx (si existe /snapshot/indicators)
-    market_ctx = {}
+        return {}
     try:
-        r = requests.get(
-            f"{API_BASE}/snapshot/indicators",
-            headers=_api_headers(),
-            params={"symbols": ",".join(symbols), "timeframe": "5Min", "limit": "200", "lookback_hours": "48"},
-            timeout=15,
-        )
-        if r.status_code == 200:
-            j = r.json()
-            if isinstance(j, dict) and isinstance(j.get("data"), dict):
-                market_ctx = j["data"]
+        resp = requests.get(f"{API_BASE}/config/status", headers=_api_headers(), timeout=5)
+        data = _safe_json(resp)
+        return data.get("data", data) if isinstance(data, dict) else {}
     except Exception:
-        market_ctx = {}
+        return {}
 
-    # 3) candidatos /signals/ai
-    candidates: List[Dict[str, Any]] = []
-    for sym in symbols:
-        ctx = market_ctx.get(sym, {}) if isinstance(market_ctx, dict) else {}
-        bias = str(ctx.get("bias_inferred", "neutral")).strip().lower()
-        if bias not in ("bullish", "bearish", "neutral"):
-            bias = "neutral"
-        try:
-            ts = int(ctx.get("trend_strength", 2) or 2)
-        except Exception:
-            ts = 2
 
-        ai_payload = _get_signals_ai(sym, bias=bias, trend_strength=ts)
-        candidates.append(_summarize_candidate(sym, ctx, ai_payload))
+def _get_alpaca_mode_from_config(config: Dict[str, Any]) -> str:
+    mode = str(config.get("alpaca_mode", "") or "").strip().lower()
+    if mode in ("paper", "live"):
+        return mode
+    mode = str(os.getenv("ALPACA_MODE", "paper")).strip().lower()
+    return mode if mode in ("paper", "live") else "paper"
 
-    # elige mejor por confidence
-    best = None
-    for c in candidates:
-        if c.get("action") not in ("buy", "sell"):
-            continue
-        if best is None or float(c.get("confidence", 0) or 0) > float(best.get("confidence", 0) or 0):
-            best = c
 
-    if not best:
+def get_account_and_positions() -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    headers = get_alpaca_headers()
+
+    acc_resp = requests.get(f"{TRADING_URL}/v2/account", headers=headers, timeout=8)
+    if acc_resp.status_code != 200:
+        raise HTTPException(status_code=acc_resp.status_code, detail=f"Error cuenta: {acc_resp.text}")
+    account = acc_resp.json()
+
+    pos_resp = requests.get(f"{TRADING_URL}/v2/positions", headers=headers, timeout=8)
+    if pos_resp.status_code not in (200, 404):
+        raise HTTPException(status_code=pos_resp.status_code, detail=f"Error posiciones: {pos_resp.text}")
+
+    positions: List[Dict[str, Any]] = [] if pos_resp.status_code == 404 else pos_resp.json()
+    return account, positions
+
+
+def get_risk_params(risk_mode: str) -> Dict[str, float]:
+    risk_mode = (risk_mode or "low").lower()
+    if risk_mode == "high":
+        return {"tp_per_trade": 0.30, "sl_per_trade": 0.15, "daily_target": 0.05, "daily_max_loss": 0.02}
+    if risk_mode == "medium":
+        return {"tp_per_trade": 0.20, "sl_per_trade": 0.10, "daily_target": 0.03, "daily_max_loss": 0.015}
+    return {"tp_per_trade": 0.15, "sl_per_trade": 0.08, "daily_target": 0.02, "daily_max_loss": 0.01}
+
+
+def _now_ny() -> datetime:
+    return datetime.now(tz=ZoneInfo("America/New_York"))
+
+
+def _is_weekday_ny() -> bool:
+    now = _now_ny()
+    dow = int(now.strftime("%u"))  # 1..7
+    return dow < 6
+
+
+def is_after_close_time() -> bool:
+    now_ny = _now_ny()
+    hhmm = int(now_ny.strftime("%H%M"))
+    return hhmm >= EOD_CLOSE_HHMM
+
+
+def _is_inside_rth() -> Tuple[bool, str]:
+    now_ny = _now_ny()
+    dow = int(now_ny.strftime("%u"))  # 1..7
+    hhmm = int(now_ny.strftime("%H%M"))
+    if dow >= 6:
+        return False, f"weekend {now_ny.isoformat()}"
+    if hhmm < 930 or hhmm >= 1600:
+        return False, f"outside_rth {now_ny.isoformat()}"
+    return True, f"inside_rth {now_ny.isoformat()}"
+
+
+def close_all_via_api() -> Dict[str, Any]:
+    if not API_BASE:
+        raise HTTPException(status_code=500, detail="RENDER_EXTERNAL_URL no definido para /alpaca/close-all")
+
+    resp = requests.post(f"{API_BASE}/alpaca/close-all", headers=_api_headers(), timeout=15)
+    if resp.status_code not in (200, 207):
+        raise HTTPException(status_code=resp.status_code, detail=f"Error /alpaca/close-all: {resp.text}")
+    return _safe_json(resp)
+
+
+def close_symbol_via_api(symbol: str) -> Dict[str, Any]:
+    if not API_BASE:
+        raise HTTPException(status_code=500, detail="RENDER_EXTERNAL_URL no definido para /alpaca/close/{symbol}")
+
+    symbol = str(symbol).strip().upper()
+    resp = requests.post(f"{API_BASE}/alpaca/close/{symbol}", headers=_api_headers(), timeout=15)
+    data = _safe_json(resp)
+    if resp.status_code in (200, 204):
+        return data if isinstance(data, dict) else {"status": "ok", "symbol": symbol}
+    raise HTTPException(status_code=resp.status_code, detail=f"Error /alpaca/close/{symbol}: {resp.text}")
+
+
+def _execute_trade_via_http(symbol: str, side: str, qty: int, alpaca_mode: Optional[str] = None) -> Dict[str, Any]:
+    if not API_BASE:
+        return {"status": "error", "detail": "API_BASE missing"}
+
+    symbol = str(symbol).strip().upper()
+    side = str(side).lower().strip()
+    qty = int(qty)
+
+    url = f"{API_BASE.rstrip('/')}/trade"
+    payload: Dict[str, Any] = {"symbol": symbol, "side": side, "qty": qty}
+    if alpaca_mode in ("paper", "live"):
+        payload["alpaca_mode"] = alpaca_mode
+
+    try:
+        r = requests.post(url, headers=_api_headers(), json=payload, timeout=15)
+        if r.status_code != 200:
+            return {"status": "error", "http": r.status_code, "body": r.text, "payload": payload}
+        return {"status": "ok", "result": _safe_json(r), "payload": payload}
+    except Exception as e:
+        return {"status": "error", "detail": str(e), "payload": payload}
+
+
+def _cooldown_key(symbol: str, side: str) -> str:
+    return f"{str(symbol).strip().upper()}|{str(side).strip().lower()}"
+
+
+def _cooldown_state(symbol: str, side: str) -> Dict[str, Any]:
+    now = datetime.utcnow()
+    key = _cooldown_key(symbol, side)
+
+    last_ts = _LAST_ENTRY_BY_KEY.get(key)
+    if not last_ts:
+        return {"allow": True, "reason": "no_last_entry_for_key", "remaining_sec": 0, "key": key}
+
+    try:
+        elapsed = (now - last_ts).total_seconds()
+    except Exception:
+        return {"allow": True, "reason": "bad_last_ts", "remaining_sec": 0, "key": key}
+
+    if elapsed < AUTO_ENTRY_COOLDOWN_SEC:
+        remaining = int(max(0, AUTO_ENTRY_COOLDOWN_SEC - elapsed))
         return {
-            "status": "ok",
-            "decision": "no_trade",
-            "why": "no_buy_sell_from_signals_ai",
-            "rule": {"tier1_conf": AGENT_TIER1_CONF, "tier2_min_conf": AGENT_TIER2_MIN_CONF, "tier2_min_trend": AGENT_TIER2_MIN_TREND},
-            "candidates": candidates,
-            "snapshot_time_et": snap_time_et.isoformat() if snap_time_et else None,
+            "allow": False,
+            "reason": f"cooldown_active elapsed={int(elapsed)}s<{AUTO_ENTRY_COOLDOWN_SEC}s",
+            "remaining_sec": remaining,
+            "key": key,
+            "last_ts": str(last_ts),
         }
 
-    conf = float(best.get("confidence", 0) or 0)
-    ts = int(best.get("trend_strength", 2) or 2)
-    allow_trade = _passes_tier_rule(conf, ts)
+    return {"allow": True, "reason": f"cooldown_ok elapsed={int(elapsed)}s", "remaining_sec": 0, "key": key}
 
-    decision_obj = {
-        "decision": "trade" if allow_trade else "no_trade",
-        "symbol": best["symbol"],
-        "side": best["action"],
-        "confidence": conf,
-        "trend_strength": ts,
-        "why": "signals_ai_best_candidate",
-    }
 
-    # 4) OpenAI puede confirmar/cancelar, PERO se aplica la misma regla dura al final
-    if OPENAI_ENABLED and OPENAI_API_KEY:
-        prompt = (
-            "Eres BDV OPCIONES LIVE. Debes RESPONDER SOLO JSON válido.\n"
-            "No inventes datos. Puedes SOLO elegir 1 candidato o NO_TRADE.\n\n"
-            f"RULE:\n"
-            f"- if confidence >= {AGENT_TIER1_CONF}: TRADE\n"
-            f"- if {AGENT_TIER2_MIN_CONF} <= confidence < {AGENT_TIER1_CONF}: TRADE only if trend_strength >= {AGENT_TIER2_MIN_TREND}\n"
-            f"- else: NO_TRADE\n\n"
-            f"CONFIG={cfg}\n"
-            f"SNAPSHOT={snap}\n"
-            f"CANDIDATES={candidates}\n\n"
-            "Devuelve exactamente:\n"
-            "{\n"
-            '  "decision": "trade"|"no_trade",\n'
-            '  "symbol": "QQQ",\n'
-            '  "side": "buy"|"sell",\n'
-            '  "confidence": 0.0,\n'
-            '  "why": "string"\n'
-            "}\n"
+def _set_last_entry(symbol: str, side: str) -> None:
+    _LAST_ENTRY_BY_KEY[_cooldown_key(symbol, side)] = datetime.utcnow()
+
+
+def _get_snapshot_prices() -> Dict[str, Dict[str, Any]]:
+    if not API_BASE:
+        return {}
+    try:
+        resp = requests.get(f"{API_BASE}/snapshot", headers=_api_headers(), timeout=8)
+        data = _safe_json(resp)
+        if isinstance(data, dict):
+            return data.get("data", {}) if isinstance(data.get("data"), dict) else {}
+        return {}
+    except Exception:
+        return {}
+
+
+def _process_pending_trades(snapshot_data: Dict[str, Dict[str, Any]], allow_execute: bool) -> List[Dict[str, Any]]:
+    now = datetime.utcnow()
+    ejecuciones: List[Dict[str, Any]] = []
+
+    for trade in list(PENDING_TRADES.values()):
+        if trade.status != "pending":
+            continue
+
+        if trade.valid_until and now > trade.valid_until:
+            trade.status = "expired"
+            trade.expired_at = now
+            ejecuciones.append({
+                "id": trade.id,
+                "symbol": trade.symbol,
+                "side": trade.side,
+                "status": "expired",
+                "reason": "valid_until alcanzado",
+            })
+            continue
+
+        info = snapshot_data.get(trade.symbol) or {}
+        price = info.get("price")
+        if price is None:
+            continue
+
+        condition_met = False
+        if trade.side == "buy":
+            if price >= trade.trigger_price and (trade.max_price is None or price <= trade.max_price):
+                condition_met = True
+
+        if not condition_met:
+            continue
+
+        if allow_execute:
+            out = _execute_trade_via_http(trade.symbol, trade.side, trade.qty)
+            trade.status = "triggered"
+            trade.triggered_at = now
+            ejecuciones.append({
+                "id": trade.id,
+                "symbol": trade.symbol,
+                "side": trade.side,
+                "qty": trade.qty,
+                "trigger_price": trade.trigger_price,
+                "max_price": trade.max_price,
+                "price_at_trigger": price,
+                "status": "triggered",
+                "trade_result": out,
+            })
+        else:
+            ejecuciones.append({
+                "id": trade.id,
+                "symbol": trade.symbol,
+                "side": trade.side,
+                "qty": trade.qty,
+                "trigger_price": trade.trigger_price,
+                "max_price": trade.max_price,
+                "price_at_trigger": price,
+                "status": "trigger_detected",
+            })
+
+    return ejecuciones
+
+
+def _get_agent_decision(exclude_symbols: List[str]) -> Dict[str, Any]:
+    if not API_BASE:
+        return {"status": "error", "detail": "API_BASE missing"}
+    params = {}
+    if exclude_symbols:
+        params["exclude"] = ",".join([s.strip().upper() for s in exclude_symbols if s.strip()])
+    try:
+        r = requests.get(
+            f"{API_BASE}{ORCH_DECISION_ENDPOINT}",
+            headers=_api_headers(),
+            params=params,
+            timeout=20,
         )
-
-        try:
-            out = _call_openai(prompt)
-            parsed = _try_parse_json(out)
-            if parsed and str(parsed.get("decision", "")).lower() in ("trade", "no_trade"):
-                dec = str(parsed.get("decision")).lower()
-                sym = str(parsed.get("symbol", best["symbol"])).strip().upper()
-                side = str(parsed.get("side", best["action"])).strip().lower()
-                try:
-                    conf2 = float(parsed.get("confidence", conf) or 0)
-                except Exception:
-                    conf2 = conf
-
-                if side not in ("buy", "sell"):
-                    side = best["action"]
-                if sym not in symbols:
-                    sym = best["symbol"]
-
-                # buscar trend_strength del símbolo elegido
-                ts2 = ts
-                for c in candidates:
-                    if str(c.get("symbol", "")).upper() == sym:
-                        try:
-                            ts2 = int(c.get("trend_strength", ts) or ts)
-                        except Exception:
-                            ts2 = ts
-                        break
-
-                allow2 = _passes_tier_rule(conf2, ts2)
-
-                decision_obj = {
-                    "decision": "trade" if (dec == "trade" and allow2) else "no_trade",
-                    "symbol": sym,
-                    "side": side,
-                    "confidence": conf2,
-                    "trend_strength": ts2,
-                    "why": str(parsed.get("why", "openai_decision")).strip()[:200],
-                }
-        except Exception:
-            pass
-
-    return {
-        "status": "ok",
-        "decision": decision_obj["decision"],
-        "symbol": decision_obj["symbol"],
-        "side": decision_obj["side"],
-        "confidence": decision_obj["confidence"],
-        "trend_strength": decision_obj["trend_strength"],
-        "why": decision_obj["why"],
-        "rule": {"tier1_conf": AGENT_TIER1_CONF, "tier2_min_conf": AGENT_TIER2_MIN_CONF, "tier2_min_trend": AGENT_TIER2_MIN_TREND},
-        "expires_in_sec": AGENT_DECISION_TTL_SEC,
-        "snapshot_time_et": snap_time_et.isoformat() if snap_time_et else None,
-        "sources": {"candidates": candidates},
-    }
+        if r.status_code != 200:
+            return {"status": "error", "http": r.status_code, "body": r.text, "params": params}
+        j = r.json()
+        return j if isinstance(j, dict) else {"status": "error", "detail": "decision_non_dict"}
+    except Exception as e:
+        return {"status": "error", "detail": str(e), "params": params}
 
 
-@router.get("/scan")
-def agent_scan(
-    x_bdv_secret: Optional[str] = Header(default=None),
-):
-    """
-    Reporta por Telegram la MISMA decisión que usa monitor (orquestado real).
-    """
+@router.get("/tick")
+def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
     _require_agent_secret(x_bdv_secret)
 
-    symbols = [s.strip().upper() for s in AGENT_SYMBOLS.split(",") if s.strip()]
-    dec = agent_decision(x_bdv_secret=x_bdv_secret)
+    config = get_config_status()
+    exec_mode = str(config.get("execution_mode", "manual")).lower()
+    risk_mode = str(config.get("risk_mode", "low")).lower()
+    max_trades_per_day = int(config.get("max_trades_per_day", 1) or 1)
+    trades_today = int(config.get("trades_today", 0) or 0)
+    alpaca_mode = _get_alpaca_mode_from_config(config)
 
-    now_et = datetime.now(tz=ZoneInfo("America/New_York"))
-    note = (
-        f"ET={now_et.strftime('%H:%M:%S')} | decision={dec.get('decision')} "
-        f"{dec.get('symbol','')} {dec.get('side','')} conf={dec.get('confidence')} "
-        f"ts={dec.get('trend_strength')} why={dec.get('why')}"
-    )
+    actions: Dict[str, Any] = {
+        "closed_all": False,
+        "closed_symbols": [],
+        "reason_all": None,
+        "pending_trades_executed": [],
+        "auto_entry": {"status": "skipped", "reason": "not_evaluated"},
+        "limits": {"max_trades_per_day": max_trades_per_day, "trades_today": trades_today},
+        "guardrails": {
+            "cooldown_sec": AUTO_ENTRY_COOLDOWN_SEC,
+            "orch_enabled": ORCH_ENABLED,
+            "max_open_positions": (MAX_OPEN_POSITIONS if MAX_OPEN_POSITIONS > 0 else max_trades_per_day),
+            "eod_close_enabled": EOD_CLOSE_ENABLED,
+            "eod_close_hhmm": EOD_CLOSE_HHMM,
+            "alpaca_mode": alpaca_mode,
+        },
+        "config_echo": {"execution_mode": exec_mode, "risk_mode": risk_mode},
+    }
 
-    title = "TRADE" if dec.get("decision") == "trade" else "NO TRADE"
-    _send_signal_telegram(symbols, title, note)
+    # Si no es auto, no hace nada (incluye cierres). Esto respeta tu “manual=yo mando”.
+    if exec_mode != "auto":
+        actions["auto_entry"] = {"status": "skipped", "reason": "execution_mode_not_auto"}
+        return _with_build_id({"status": "skipped", "reason": "execution_mode!='auto'", "actions": actions})
 
-    return {"status": "ok", "decision": dec, "note": note}
+    # Cargar cuenta/posiciones SIEMPRE para permitir cierre EOD aunque tick llegue tarde
+    account, positions = get_account_and_positions()
+    open_symbols = sorted(list({str(p.get("symbol", "")).upper() for p in positions if p.get("symbol")}))
+    actions["positions_count"] = len(positions)
+    actions["open_symbols"] = open_symbols
+
+    inside_rth, rth_reason = _is_inside_rth()
+
+    # ✅ CIERRE EOD incluso si ya pasó de las 16:00 (si tick corre tarde)
+    if EOD_CLOSE_ENABLED and positions and _is_weekday_ny() and is_after_close_time():
+        result = close_all_via_api()
+        actions["closed_all"] = True
+        actions["reason_all"] = "EOD close >= 15:45 ET"
+        actions["close_all_response"] = result
+        actions["auto_entry"] = {"status": "skipped", "reason": "eod_close"}
+        return _with_build_id({"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "actions": actions})
+
+    # Si no estamos en RTH, no abrimos trades ni pending triggers
+    if not inside_rth:
+        actions["auto_entry"] = {"status": "skipped", "reason": rth_reason}
+        return _with_build_id({"status": "skipped", "reason": rth_reason, "actions": actions})
+
+    # Risk metrics diarios
+    equity = float(account.get("equity", 0.0))
+    last_equity = float(account.get("last_equity", equity))
+    pnl_today = equity - last_equity
+
+    params = get_risk_params(risk_mode)
+    daily_target_abs = equity * params["daily_target"]
+    daily_max_loss_abs = -equity * params["daily_max_loss"]
+
+    actions["daily_params"] = {
+        "pnl_today": pnl_today,
+        "equity": equity,
+        "last_equity": last_equity,
+        "target_abs": daily_target_abs,
+        "max_loss_abs": daily_max_loss_abs,
+    }
+    actions["per_trade_params"] = {"tp_per_trade": params["tp_per_trade"], "sl_per_trade": params["sl_per_trade"]}
+
+    # Cierres por meta / pérdida diaria
+    if positions and pnl_today >= daily_target_abs:
+        result = close_all_via_api()
+        actions["closed_all"] = True
+        actions["reason_all"] = "Meta diaria alcanzada"
+        actions["close_all_response"] = result
+        actions["auto_entry"] = {"status": "skipped", "reason": "daily_target"}
+        return _with_build_id({"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "actions": actions})
+
+    if positions and pnl_today <= daily_max_loss_abs:
+        result = close_all_via_api()
+        actions["closed_all"] = True
+        actions["reason_all"] = "Pérdida diaria máxima alcanzada"
+        actions["close_all_response"] = result
+        actions["auto_entry"] = {"status": "skipped", "reason": "daily_max_loss"}
+        return _with_build_id({"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "actions": actions})
+
+    # TP/SL por posición
+    for pos in positions:
+        symbol = str(pos.get("symbol") or "").strip().upper()
+        if not symbol:
+            continue
+        try:
+            plpc = float(pos.get("unrealized_plpc", 0.0))
+        except (TypeError, ValueError):
+            plpc = 0.0
+
+        if plpc >= params["tp_per_trade"]:
+            resp = close_symbol_via_api(symbol)
+            actions["closed_symbols"].append({"symbol": symbol, "reason": f"Take profit ({plpc:.2%})", "api_response": resp})
+        elif plpc <= -params["sl_per_trade"]:
+            resp = close_symbol_via_api(symbol)
+            actions["closed_symbols"].append({"symbol": symbol, "reason": f"Stop loss ({plpc:.2%})", "api_response": resp})
+
+    # Pending trades (solo en RTH)
+    snapshot_data = _get_snapshot_prices()
+    try:
+        actions["pending_trades_executed"] = _process_pending_trades(snapshot_data, allow_execute=True)
+    except Exception:
+        actions["pending_trades_executed"] = []
+
+    # ========= AUTO ENTRY (ORQUESTADO) =========
+    max_open_positions = MAX_OPEN_POSITIONS if MAX_OPEN_POSITIONS > 0 else max_trades_per_day
+
+    if trades_today >= max_trades_per_day:
+        actions["auto_entry"] = {"status": "skipped", "reason": "max_trades_per_day_reached", "limits": actions["limits"]}
+        return _with_build_id({"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "actions": actions})
+
+    if len(open_symbols) >= max_open_positions:
+        actions["auto_entry"] = {
+            "status": "skipped",
+            "reason": "max_open_positions_reached",
+            "open_symbols": open_symbols,
+            "max_open_positions": max_open_positions,
+        }
+        return _with_build_id({"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "actions": actions})
+
+    if not ORCH_ENABLED:
+        actions["auto_entry"] = {"status": "skipped", "reason": "ORCH_ENABLED=false"}
+        return _with_build_id({"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "actions": actions})
+
+    # ✅ pide decisión excluyendo símbolos ya abiertos (para permitir NVDA + QQQ + SPY)
+    dec = _get_agent_decision(exclude_symbols=open_symbols)
+    actions["orchestrator_decision"] = dec
+
+    if dec.get("decision") != "trade":
+        actions["auto_entry"] = {"status": "skipped", "reason": "decision_no_trade", "detail": dec.get("why")}
+        return _with_build_id({"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "actions": actions})
+
+    symbol = str(dec.get("symbol") or "").strip().upper()
+    side = str(dec.get("side") or "").strip().lower()
+
+    if not symbol or side not in ("buy", "sell"):
+        actions["auto_entry"] = {"status": "skipped", "reason": "bad_decision_payload", "decision": dec}
+        return _with_build_id({"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "actions": actions})
+
+    if symbol in open_symbols:
+        actions["auto_entry"] = {"status": "skipped", "reason": "symbol_already_open", "symbol": symbol, "open_symbols": open_symbols}
+        return _with_build_id({"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "actions": actions})
+
+    cd = _cooldown_state(symbol, side)
+    if not cd.get("allow", True):
+        actions["auto_entry"] = {"status": "skipped", "reason": "cooldown", "cooldown": cd, "picked": {"symbol": symbol, "side": side}}
+        return _with_build_id({"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "actions": actions})
+
+    qty = 1
+    out = _execute_trade_via_http(symbol, side, qty, alpaca_mode=alpaca_mode)
+    if out.get("status") == "ok":
+        _set_last_entry(symbol, side)
+
+    actions["auto_entry"] = {
+        "status": "attempted",
+        "source": "agent/decision",
+        "picked": {"symbol": symbol, "side": side, "confidence": dec.get("confidence"), "why": dec.get("why")},
+        "qty": qty,
+        "trade_result": out,
+        "cooldown": cd,
+        "alpaca_mode": alpaca_mode,
+    }
+
+    return _with_build_id({"status": "ok", "mode": exec_mode, "risk_mode": risk_mode, "actions": actions})
