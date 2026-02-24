@@ -22,12 +22,16 @@ OPENAI_ENABLED = os.getenv("OPENAI_ENABLED", "0").strip().lower() in ("1", "true
 AGENT_SYMBOLS = os.getenv("AGENT_SYMBOLS", "QQQ,SPY,NVDA")
 AGENT_SEND_TELEGRAM = os.getenv("AGENT_SEND_TELEGRAM", "1").strip().lower() not in ("0", "false", "no")
 
-# ✅ Orquestación (suave por defecto)
+# ✅ Orquestación (encendida por defecto)
 AGENT_DECISION_ENABLED = os.getenv("AGENT_DECISION_ENABLED", "1").strip().lower() in ("1", "true", "yes", "y", "on")
-AGENT_DECISION_MIN_CONF = float(os.getenv("AGENT_DECISION_MIN_CONF", "0.70"))
 AGENT_DECISION_TTL_SEC = int(os.getenv("AGENT_DECISION_TTL_SEC", "120"))
 
-# Semáforo (para scan)
+# ✅ Regla por tiers (la que pediste)
+AGENT_TIER1_CONF = float(os.getenv("AGENT_TIER1_CONF", "0.75"))
+AGENT_TIER2_MIN_CONF = float(os.getenv("AGENT_TIER2_MIN_CONF", "0.66"))
+AGENT_TIER2_MIN_TREND = int(os.getenv("AGENT_TIER2_MIN_TREND", "3"))
+
+# Semáforo (opcional para scan)
 AGENT_STALE_GREEN_MAX_SEC = int(os.getenv("AGENT_STALE_GREEN_MAX_SEC", "120"))
 AGENT_STALE_YELLOW_MAX_SEC = int(os.getenv("AGENT_STALE_YELLOW_MAX_SEC", "600"))
 AGENT_ALLOW_YELLOW_SUMMARY = os.getenv("AGENT_ALLOW_YELLOW_SUMMARY", "1").strip().lower() in ("1", "true", "yes", "y", "on")
@@ -60,10 +64,8 @@ def _parse_snapshot_time_et(snapshot: Dict[str, Any]) -> Optional[datetime]:
             if isinstance(v, dict) and (v.get("time") or v.get("timestamp")):
                 t = v.get("time") or v.get("timestamp")
                 break
-
     if not t:
         return None
-
     try:
         s = str(t).replace("Z", "+00:00")
         dt_utc = datetime.fromisoformat(s)
@@ -72,13 +74,6 @@ def _parse_snapshot_time_et(snapshot: Dict[str, Any]) -> Optional[datetime]:
         return dt_utc.astimezone(ZoneInfo("America/New_York"))
     except Exception:
         return None
-
-
-def _is_rth(et_dt: datetime) -> bool:
-    h, m = et_dt.hour, et_dt.minute
-    after_open = (h > 9) or (h == 9 and m >= 30)
-    before_close = (h < 16) or (h == 16 and m == 0)
-    return after_open and before_close
 
 
 def _call_openai(prompt: str) -> str:
@@ -115,14 +110,12 @@ def _try_parse_json(text: str) -> Optional[Dict[str, Any]]:
         return None
     text = text.strip()
 
-    # intento directo
     try:
         obj = json.loads(text)
         return obj if isinstance(obj, dict) else None
     except Exception:
         pass
 
-    # intento “buscar el primer { ... }”
     try:
         start = text.find("{")
         end = text.rfind("}")
@@ -173,24 +166,36 @@ def _summarize_candidate(symbol: str, ctx: Dict[str, Any], ai_payload: Dict[str,
         conf = float(data.get("confidence", 0) or 0)
     except Exception:
         conf = 0.0
+    try:
+        ts = int(ctx.get("trend_strength", 2) or 2)
+    except Exception:
+        ts = 2
+
     return {
         "symbol": symbol,
         "bias": str(ctx.get("bias_inferred", "neutral")),
-        "trend_strength": int(ctx.get("trend_strength", 1) or 1),
+        "trend_strength": ts,
         "action": action,
         "confidence": conf,
     }
 
 
+def _passes_tier_rule(conf: float, trend_strength: int) -> bool:
+    if conf >= AGENT_TIER1_CONF:
+        return True
+    if conf >= AGENT_TIER2_MIN_CONF and trend_strength >= AGENT_TIER2_MIN_TREND:
+        return True
+    return False
+
+
 @router.get("/decision")
 def agent_decision(
     x_bdv_secret: Optional[str] = Header(default=None),
-    min_conf: float = Query(default=None),
 ):
     """
-    ✅ DECISIÓN ÚNICA (para orquestación):
-    - Se usa por /monitor/tick para ejecutar
-    - Se usa por /agent/scan para reportar (Telegram)
+    ✅ Fuente de verdad para ejecución:
+    - /monitor/tick llama aquí
+    - /agent/scan reporta lo mismo
     """
     _require_agent_secret(x_bdv_secret)
 
@@ -200,18 +205,16 @@ def agent_decision(
     if not AGENT_DECISION_ENABLED:
         return {"status": "ok", "decision": "no_trade", "why": "AGENT_DECISION_ENABLED=false"}
 
-    threshold = float(min_conf) if min_conf is not None else float(AGENT_DECISION_MIN_CONF)
-
-    # 1) config + snapshot
+    # 1) config + snapshot (para contexto y auditoría)
     cfg = _get_json(f"{API_BASE}/config/status", timeout=8)
     snap = _get_json(f"{API_BASE}/snapshot", timeout=8)
-    snap_time_et = _parse_snapshot_time_et(snap if isinstance(snap, dict) else {})  # para contexto
+    snap_time_et = _parse_snapshot_time_et(snap if isinstance(snap, dict) else {})
 
     symbols = [s.strip().upper() for s in AGENT_SYMBOLS.split(",") if s.strip()]
     if not symbols:
         symbols = ["QQQ"]
 
-    # 2) market_ctx (si existe)
+    # 2) market_ctx (si existe /snapshot/indicators)
     market_ctx = {}
     try:
         r = requests.get(
@@ -227,7 +230,7 @@ def agent_decision(
     except Exception:
         market_ctx = {}
 
-    # 3) candidatos por signals/ai (esto asegura que agent y monitor hablen “el mismo idioma”)
+    # 3) candidatos /signals/ai
     candidates: List[Dict[str, Any]] = []
     for sym in symbols:
         ctx = market_ctx.get(sym, {}) if isinstance(market_ctx, dict) else {}
@@ -242,7 +245,7 @@ def agent_decision(
         ai_payload = _get_signals_ai(sym, bias=bias, trend_strength=ts)
         candidates.append(_summarize_candidate(sym, ctx, ai_payload))
 
-    # elegir “mejor” por confidence
+    # elige mejor por confidence
     best = None
     for c in candidates:
         if c.get("action") not in ("buy", "sell"):
@@ -250,31 +253,38 @@ def agent_decision(
         if best is None or float(c.get("confidence", 0) or 0) > float(best.get("confidence", 0) or 0):
             best = c
 
-    # si no hay señal clara
     if not best:
         return {
             "status": "ok",
             "decision": "no_trade",
             "why": "no_buy_sell_from_signals_ai",
-            "threshold": threshold,
+            "rule": {"tier1_conf": AGENT_TIER1_CONF, "tier2_min_conf": AGENT_TIER2_MIN_CONF, "tier2_min_trend": AGENT_TIER2_MIN_TREND},
             "candidates": candidates,
             "snapshot_time_et": snap_time_et.isoformat() if snap_time_et else None,
         }
 
-    # 4) si OpenAI está habilitado, que “panel experto” confirme o cancele (pero NO invente)
+    conf = float(best.get("confidence", 0) or 0)
+    ts = int(best.get("trend_strength", 2) or 2)
+    allow_trade = _passes_tier_rule(conf, ts)
+
     decision_obj = {
-        "decision": "trade" if float(best["confidence"]) >= threshold else "no_trade",
+        "decision": "trade" if allow_trade else "no_trade",
         "symbol": best["symbol"],
         "side": best["action"],
-        "confidence": float(best["confidence"]),
+        "confidence": conf,
+        "trend_strength": ts,
         "why": "signals_ai_best_candidate",
     }
 
+    # 4) OpenAI puede confirmar/cancelar, PERO se aplica la misma regla dura al final
     if OPENAI_ENABLED and OPENAI_API_KEY:
         prompt = (
             "Eres BDV OPCIONES LIVE. Debes RESPONDER SOLO JSON válido.\n"
             "No inventes datos. Puedes SOLO elegir 1 candidato o NO_TRADE.\n\n"
-            f"THRESHOLD_MIN_CONF={threshold}\n"
+            f"RULE:\n"
+            f"- if confidence >= {AGENT_TIER1_CONF}: TRADE\n"
+            f"- if {AGENT_TIER2_MIN_CONF} <= confidence < {AGENT_TIER1_CONF}: TRADE only if trend_strength >= {AGENT_TIER2_MIN_TREND}\n"
+            f"- else: NO_TRADE\n\n"
             f"CONFIG={cfg}\n"
             f"SNAPSHOT={snap}\n"
             f"CANDIDATES={candidates}\n\n"
@@ -292,26 +302,37 @@ def agent_decision(
             out = _call_openai(prompt)
             parsed = _try_parse_json(out)
             if parsed and str(parsed.get("decision", "")).lower() in ("trade", "no_trade"):
-                # normaliza
                 dec = str(parsed.get("decision")).lower()
                 sym = str(parsed.get("symbol", best["symbol"])).strip().upper()
                 side = str(parsed.get("side", best["action"])).strip().lower()
                 try:
-                    conf = float(parsed.get("confidence", best["confidence"]) or 0)
+                    conf2 = float(parsed.get("confidence", conf) or 0)
                 except Exception:
-                    conf = float(best["confidence"])
+                    conf2 = conf
 
-                # hard clamp
                 if side not in ("buy", "sell"):
                     side = best["action"]
                 if sym not in symbols:
                     sym = best["symbol"]
 
+                # buscar trend_strength del símbolo elegido
+                ts2 = ts
+                for c in candidates:
+                    if str(c.get("symbol", "")).upper() == sym:
+                        try:
+                            ts2 = int(c.get("trend_strength", ts) or ts)
+                        except Exception:
+                            ts2 = ts
+                        break
+
+                allow2 = _passes_tier_rule(conf2, ts2)
+
                 decision_obj = {
-                    "decision": dec if conf >= threshold and dec == "trade" else "no_trade",
+                    "decision": "trade" if (dec == "trade" and allow2) else "no_trade",
                     "symbol": sym,
                     "side": side,
-                    "confidence": conf,
+                    "confidence": conf2,
+                    "trend_strength": ts2,
                     "why": str(parsed.get("why", "openai_decision")).strip()[:200],
                 }
         except Exception:
@@ -323,8 +344,9 @@ def agent_decision(
         "symbol": decision_obj["symbol"],
         "side": decision_obj["side"],
         "confidence": decision_obj["confidence"],
+        "trend_strength": decision_obj["trend_strength"],
         "why": decision_obj["why"],
-        "threshold": threshold,
+        "rule": {"tier1_conf": AGENT_TIER1_CONF, "tier2_min_conf": AGENT_TIER2_MIN_CONF, "tier2_min_trend": AGENT_TIER2_MIN_TREND},
         "expires_in_sec": AGENT_DECISION_TTL_SEC,
         "snapshot_time_et": snap_time_et.isoformat() if snap_time_et else None,
         "sources": {"candidates": candidates},
@@ -334,22 +356,21 @@ def agent_decision(
 @router.get("/scan")
 def agent_scan(
     x_bdv_secret: Optional[str] = Header(default=None),
-    force_analysis: int = 0,
 ):
     """
-    ✅ Ahora /scan se alinea con /decision:
-    - saca la misma decisión y la reporta
-    - no ejecuta trades (eso lo hace monitor)
+    Reporta por Telegram la MISMA decisión que usa monitor (orquestado real).
     """
     _require_agent_secret(x_bdv_secret)
 
     symbols = [s.strip().upper() for s in AGENT_SYMBOLS.split(",") if s.strip()]
-
-    # reutiliza decision (misma “fuente de verdad”)
-    dec = agent_decision(x_bdv_secret=x_bdv_secret, min_conf=None)
+    dec = agent_decision(x_bdv_secret=x_bdv_secret)
 
     now_et = datetime.now(tz=ZoneInfo("America/New_York"))
-    note = f"ET={now_et.strftime('%H:%M:%S')} | decision={dec.get('decision')} {dec.get('symbol','')} {dec.get('side','')} conf={dec.get('confidence')} why={dec.get('why')}"
+    note = (
+        f"ET={now_et.strftime('%H:%M:%S')} | decision={dec.get('decision')} "
+        f"{dec.get('symbol','')} {dec.get('side','')} conf={dec.get('confidence')} "
+        f"ts={dec.get('trend_strength')} why={dec.get('why')}"
+    )
 
     title = "TRADE" if dec.get("decision") == "trade" else "NO TRADE"
     _send_signal_telegram(symbols, title, note)
