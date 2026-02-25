@@ -5,14 +5,16 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Dict, Any, List, Optional, Tuple, Set
 
-from .pending_trades import PENDING_TRADES
-
 router = APIRouter(prefix="/monitor", tags=["monitor"])
 
 API_BASE = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 
 _raw_trading = os.getenv("APCA_TRADING_URL", "https://paper-api.alpaca.markets").rstrip("/")
-TRADING_URL = _raw_trading[:-3] if _raw_trading.endswith("/v2") else _raw_trading
+# ✅ robusto: quita /v2 sin dejar slash extra
+if _raw_trading.endswith("/v2"):
+    TRADING_URL = _raw_trading[:-3].rstrip("/")
+else:
+    TRADING_URL = _raw_trading.rstrip("/")
 
 BDV_AGENT_SECRET = os.getenv("BDV_AGENT_SECRET", "").strip()
 BUILD_ID = os.getenv("BUILD_ID", "unknown")
@@ -40,12 +42,10 @@ def _bool_env(name: str, default: bool = False) -> bool:
 
 
 AUTO_ENTRY_COOLDOWN_SEC = _env_int("AUTO_ENTRY_COOLDOWN_SEC", 1800)
-AUTO_ENTRY_MAX_PER_TICK = _env_int("AUTO_ENTRY_MAX_PER_TICK", 3)  # abrir hasta 3 si hay señales
+AUTO_ENTRY_MAX_PER_TICK = _env_int("AUTO_ENTRY_MAX_PER_TICK", 3)
 
-# Orquestación real
 ORCH_ENABLED = _bool_env("ORCH_ENABLED", True)
 
-# Market context gate (si lo usas)
 MARKET_CTX_ENABLED = str(os.getenv("MARKET_CTX_ENABLED", "true")).strip().lower() in ("1", "true", "yes", "y", "on")
 MARKET_TREND_MIN = _env_int("MARKET_TREND_MIN", 2)
 MARKET_CTX_TIMEFRAME = os.getenv("MARKET_CTX_TIMEFRAME", "5Min").strip()
@@ -101,7 +101,7 @@ def get_config_status() -> Dict[str, Any]:
     if not API_BASE:
         return {}
     try:
-        resp = requests.get(f"{API_BASE}/config/status", headers=_api_headers(), timeout=5)
+        resp = requests.get(f"{API_BASE}/config/status", headers=_api_headers(), timeout=8)
         data = _safe_json(resp)
         return data.get("data", data) if isinstance(data, dict) else {}
     except Exception:
@@ -119,12 +119,12 @@ def _get_alpaca_mode_from_config(config: Dict[str, Any]) -> str:
 def get_account_and_positions() -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     headers = get_alpaca_headers()
 
-    acc_resp = requests.get(f"{TRADING_URL}/v2/account", headers=headers, timeout=8)
+    acc_resp = requests.get(f"{TRADING_URL}/v2/account", headers=headers, timeout=10)
     if acc_resp.status_code != 200:
         raise HTTPException(status_code=acc_resp.status_code, detail=f"Error cuenta: {acc_resp.text}")
     account = acc_resp.json()
 
-    pos_resp = requests.get(f"{TRADING_URL}/v2/positions", headers=headers, timeout=8)
+    pos_resp = requests.get(f"{TRADING_URL}/v2/positions", headers=headers, timeout=10)
     if pos_resp.status_code not in (200, 404):
         raise HTTPException(status_code=pos_resp.status_code, detail=f"Error posiciones: {pos_resp.text}")
 
@@ -156,10 +156,6 @@ def _is_inside_rth(now_ny: datetime) -> Tuple[bool, str]:
 
 
 def _in_eod_close_window(now_ny: datetime) -> bool:
-    """
-    ✅ SOLO cierra entre 15:45 y antes de 16:00 (NY).
-    ❌ Si ya son >=16:00 no cierra (por tu regla).
-    """
     if not EOD_CLOSE_ENABLED:
         return False
     hhmm = now_ny.hour * 100 + now_ny.minute
@@ -170,7 +166,7 @@ def _in_eod_close_window(now_ny: datetime) -> bool:
 def close_all_via_api() -> Dict[str, Any]:
     if not API_BASE:
         raise HTTPException(status_code=500, detail="RENDER_EXTERNAL_URL no definido para /alpaca/close-all")
-    resp = requests.post(f"{API_BASE}/alpaca/close-all", headers=_api_headers(), timeout=15)
+    resp = requests.post(f"{API_BASE}/alpaca/close-all", headers=_api_headers(), timeout=20)
     if resp.status_code not in (200, 207):
         raise HTTPException(status_code=resp.status_code, detail=f"Error /alpaca/close-all: {resp.text}")
     return _safe_json(resp)
@@ -181,7 +177,7 @@ def close_symbol_via_api(symbol: str) -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail="RENDER_EXTERNAL_URL no definido para /alpaca/close/{symbol}")
 
     symbol = str(symbol).strip().upper()
-    resp = requests.post(f"{API_BASE}/alpaca/close/{symbol}", headers=_api_headers(), timeout=12)
+    resp = requests.post(f"{API_BASE}/alpaca/close/{symbol}", headers=_api_headers(), timeout=15)
     data = _safe_json(resp)
     if resp.status_code in (200, 204):
         return data if isinstance(data, dict) else {"status": "ok", "symbol": symbol}
@@ -202,7 +198,7 @@ def _execute_trade_via_http(symbol: str, side: str, qty: int, alpaca_mode: Optio
         payload["alpaca_mode"] = alpaca_mode
 
     try:
-        r = requests.post(url, headers=_api_headers(), json=payload, timeout=15)
+        r = requests.post(url, headers=_api_headers(), json=payload, timeout=20)
         if r.status_code != 200:
             return {"status": "error", "http": r.status_code, "body": r.text, "payload": payload}
         return {"status": "ok", "result": _safe_json(r), "payload": payload}
@@ -249,7 +245,7 @@ def _get_agent_decision(exclude_symbols: Set[str]) -> Dict[str, Any]:
         params = {}
         if exclude_symbols:
             params["exclude_symbols"] = ",".join(sorted(list(exclude_symbols)))
-        r = requests.get(f"{API_BASE}/agent/decision", headers=_api_headers(), params=params, timeout=15)
+        r = requests.get(f"{API_BASE}/agent/decision", headers=_api_headers(), params=params, timeout=20)
         if r.status_code != 200:
             return {"status": "error", "http": r.status_code, "body": r.text}
         data = _safe_json(r)
@@ -299,7 +295,7 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
     actions["positions_count"] = len(positions)
     actions["open_symbols"] = sorted(list(_open_position_symbols(positions)))
 
-    # 2) ✅ CIERRE EOD SOLO si estás DENTRO de RTH y dentro de la ventana 15:45–16:00
+    # 2) CIERRE EOD SOLO dentro de RTH y dentro de ventana 15:45–16:00
     if positions and inside_rth and _in_eod_close_window(now_ny):
         try:
             result = close_all_via_api()
@@ -315,7 +311,7 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
         actions["auto_entries"].append({"status": "skipped", "reason": "execution_mode_not_auto"})
         return _with_build_id({"status": "skipped", "reason": f"execution_mode='{exec_mode}'", "actions": actions})
 
-    # 4) fuera de RTH no abrir (y por tu regla, tampoco “EOD after-hours”)
+    # 4) fuera de RTH no abrir
     if not inside_rth:
         actions["auto_entries"].append({"status": "skipped", "reason": "outside_rth_no_new_entries"})
         return _with_build_id({"status": "skipped", "reason": rth_reason, "actions": actions})
@@ -363,9 +359,10 @@ def monitor_tick(x_bdv_secret: Optional[str] = Header(default=None)):
             actions["auto_entries"].append({"status": "skipped", "reason": "bad_agent_decision_payload", "agent_decision": dec})
             break
 
-        if sym in open_syms:
+        # ✅ evita repetir símbolo ya abierto o ya intentado en este tick
+        if sym in open_syms or sym in attempted_syms:
             attempted_syms.add(sym)
-            actions["auto_entries"].append({"status": "skipped", "reason": "symbol_already_open", "symbol": sym})
+            actions["auto_entries"].append({"status": "skipped", "reason": "symbol_already_open_or_attempted", "symbol": sym})
             continue
 
         cd = _cooldown_state(sym, side)
