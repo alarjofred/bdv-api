@@ -199,6 +199,65 @@ def market_snapshot():
 
 
 # ---------------------------------
+# Endpoint /snapshot/v2
+# Bloque 7B: versión nueva sin conflicto
+# ---------------------------------
+@app.get("/snapshot/v2")
+def market_snapshot_v2():
+    if not has_alpaca_keys():
+        raise HTTPException(status_code=500, detail="Faltan keys de Alpaca para /snapshot/v2.")
+
+    symbols = ["QQQ", "SPY", "NVDA"]
+    data = {}
+
+    try:
+        for sym in symbols:
+            raw = get_latest_quote(sym)
+            quote = raw.get("quote") or {}
+
+            bid = quote.get("bp")
+            ask = quote.get("ap")
+            ts = quote.get("t")
+
+            try:
+                bid_f = float(bid) if bid is not None else None
+            except Exception:
+                bid_f = None
+
+            try:
+                ask_f = float(ask) if ask is not None else None
+            except Exception:
+                ask_f = None
+
+            price = None
+            spread = None
+            data_quality_ok = False
+
+            if bid_f is not None and ask_f is not None and bid_f > 0 and ask_f > 0 and ask_f >= bid_f:
+                price = round((bid_f + ask_f) / 2.0, 4)
+                spread = round(ask_f - bid_f, 4)
+                data_quality_ok = True
+            elif ask_f is not None and ask_f > 0:
+                price = round(ask_f, 4)
+            elif bid_f is not None and bid_f > 0:
+                price = round(bid_f, 4)
+
+            data[sym] = {
+                "price": price,
+                "time": ts,
+                "bid": bid_f,
+                "ask": ask_f,
+                "spread": spread,
+                "data_quality_ok": data_quality_ok,
+            }
+
+        return {"status": "ok", "data": data, "build_id": BUILD_ID}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error getting snapshot/v2: {e}")
+
+
+# ---------------------------------
 # Log de trades (persistente)
 # ---------------------------------
 def append_trade_log(entry: dict) -> None:
