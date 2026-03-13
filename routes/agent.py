@@ -223,7 +223,7 @@ def agent_decision(
     if not symbols:
         return {"status": "ok", "decision": "no_trade", "why": "all_symbols_excluded", "excluded": sorted(list(excl))}
 
-    # market_ctx (si existe)
+    # market_ctx
     market_ctx = {}
     try:
         r = requests.get(
@@ -239,17 +239,42 @@ def agent_decision(
     except Exception:
         market_ctx = {}
 
-    # candidatos por signals/ai
+    # candidatos por signals/ai, filtrando contexto malo o insuficiente
     candidates: List[Dict[str, Any]] = []
+    skipped_symbols: List[Dict[str, Any]] = []
+
     for sym in symbols:
         ctx = market_ctx.get(sym, {}) if isinstance(market_ctx, dict) else {}
+
+        status_ctx = str(ctx.get("status", "ok")).strip().lower()
+        if status_ctx not in ("ok", ""):
+            skipped_symbols.append({
+                "symbol": sym,
+                "reason": f"market_ctx_status={status_ctx}",
+                "ctx": ctx,
+            })
+            continue
+
+        data_quality_ok = ctx.get("data_quality_ok", True)
+        if data_quality_ok is False:
+            skipped_symbols.append({
+                "symbol": sym,
+                "reason": "data_quality_ok=false",
+                "ctx": ctx,
+            })
+            continue
+
         bias = str(ctx.get("bias_inferred", "neutral")).strip().lower()
         if bias not in ("bullish", "bearish", "neutral"):
             bias = "neutral"
+
         try:
-            ts = int(ctx.get("trend_strength", 2) or 2)
+            ts = int(ctx.get("trend_strength", 1) or 1)
         except Exception:
-            ts = 2
+            ts = 1
+
+        if ts < 1:
+            ts = 1
 
         ai_payload = _get_signals_ai(sym, bias=bias, trend_strength=ts)
         candidates.append(_summarize_candidate(sym, ctx, ai_payload))
@@ -266,8 +291,9 @@ def agent_decision(
         return {
             "status": "ok",
             "decision": "no_trade",
-            "why": "no_buy_sell_from_signals_ai",
+            "why": "no_valid_candidates_from_market_ctx_or_signals_ai",
             "candidates": candidates,
+            "skipped_symbols": skipped_symbols,
             "snapshot_time_et": snap_time_et.isoformat() if snap_time_et else None,
             "rule": {"strong": CONF_STRONG, "weak": CONF_WEAK, "weak_trend_min": WEAK_TREND_MIN},
         }
@@ -292,7 +318,8 @@ def agent_decision(
             f"RULE: strong_conf>={CONF_STRONG}, weak_conf>={CONF_WEAK} requires trend_strength>={WEAK_TREND_MIN}\n"
             f"CONFIG={cfg}\n"
             f"SNAPSHOT={snap}\n"
-            f"CANDIDATES={candidates}\n\n"
+            f"CANDIDATES={candidates}\n"
+            f"SKIPPED_SYMBOLS={skipped_symbols}\n\n"
             "Devuelve exactamente:\n"
             "{\n"
             '  "decision": "trade"|"no_trade",\n'
@@ -316,7 +343,7 @@ def agent_decision(
 
                 if side not in ("buy", "sell"):
                     side = best["action"]
-                if sym not in symbols:
+                if sym not in [c["symbol"] for c in candidates]:
                     sym = best["symbol"]
 
                 allow2, rule_why2 = _rule_allows_trade(conf2, ts)
@@ -339,7 +366,7 @@ def agent_decision(
         "why": decision_obj["why"],
         "expires_in_sec": AGENT_DECISION_TTL_SEC,
         "snapshot_time_et": snap_time_et.isoformat() if snap_time_et else None,
-        "sources": {"candidates": candidates},
+        "sources": {"candidates": candidates, "skipped_symbols": skipped_symbols},
         "rule": {"strong": CONF_STRONG, "weak": CONF_WEAK, "weak_trend_min": WEAK_TREND_MIN},
         "excluded": sorted(list(excl)),
     }
