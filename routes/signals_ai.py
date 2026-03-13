@@ -107,7 +107,7 @@ STRATEGY_LIBRARY: Dict[str, Dict[str, Any]] = {
     "trend_stock_buy": {
         "human_label": "Stock Trend Buy – momentum confirmado",
         "time_frame": "5m",
-        "confidence": 0.74,  # ajustable
+        "confidence": 0.74,
         "structure": {
             "kind": "none",
             "direction": "none",
@@ -116,7 +116,7 @@ STRATEGY_LIBRARY: Dict[str, Dict[str, Any]] = {
             "delta_hint": None,
         },
         "risk": {
-            "stop_loss_pct": 0.35,     # referencia informativa
+            "stop_loss_pct": 0.35,
             "take_profit_pct": 0.60,
             "trailing_from_pct": 0.35,
             "trailing_stop_pct": 0.25,
@@ -129,7 +129,7 @@ STRATEGY_LIBRARY: Dict[str, Dict[str, Any]] = {
     "trend_stock_sell": {
         "human_label": "Stock Trend Sell – presión bajista confirmada",
         "time_frame": "5m",
-        "confidence": 0.74,  # ajustable
+        "confidence": 0.74,
         "structure": {
             "kind": "none",
             "direction": "none",
@@ -152,7 +152,7 @@ STRATEGY_LIBRARY: Dict[str, Dict[str, Any]] = {
     "scalp_stock_momo_buy": {
         "human_label": "Stock Scalp Buy – impulso corto plazo",
         "time_frame": "5m",
-        "confidence": 0.66,  # más permisivo
+        "confidence": 0.66,
         "structure": {
             "kind": "none",
             "direction": "none",
@@ -262,21 +262,71 @@ def _infer_action(strategy_code: str, bias: Bias, confidence: float, kind: Struc
 
 def choose_strategy_code(symbol: str, bias: str, trend_strength: int, near_extreme: bool, prefer_spreads: bool) -> str:
     """
-    ✅ SUAVIZADO (lo que faltaba):
-    - trend_strength 1 => scalp (entra más rápido)
-    - trend_strength 2-3 => trend (más fuerte)
+    Selección de estrategia más coherente con contexto:
     - neutral => no_trade
+    - trend_strength 0 => no_trade
+    - trend_strength 1 => scalp
+    - trend_strength 2-3 => trend
     """
     if bias == "neutral":
         return "no_trade"
 
-    if trend_strength <= 1:
+    if trend_strength <= 0:
+        return "no_trade"
+
+    if trend_strength == 1:
         return "scalp_stock_momo_buy" if bias == "bullish" else "scalp_stock_momo_sell"
 
     return "trend_stock_buy" if bias == "bullish" else "trend_stock_sell"
 
 
-def build_ai_signal_response(symbol: str, bias: Bias, strategy_code: str, params_echo: Optional[Dict[str, Any]] = None) -> OptionSignal:
+def _dynamic_confidence(strategy_code: str, bias: Bias, trend_strength: int, near_extreme: bool) -> float:
+    """
+    Ajusta confidence con el contexto real.
+    Base:
+    - no_trade => 0.0
+    - scalp => 0.62
+    - trend => 0.70
+
+    Ajustes:
+    - ts=2 => +0.04
+    - ts=3 => +0.08
+    - near_extreme => -0.03
+    """
+    if strategy_code == "no_trade" or bias == Bias.neutral:
+        return 0.0
+
+    if strategy_code.startswith("scalp_"):
+        conf = 0.62
+    elif strategy_code.startswith("trend_"):
+        conf = 0.70
+    else:
+        conf = 0.60
+
+    if trend_strength == 2:
+        conf += 0.04
+    elif trend_strength >= 3:
+        conf += 0.08
+
+    if near_extreme:
+        conf -= 0.03
+
+    if conf < 0.0:
+        conf = 0.0
+    if conf > 0.95:
+        conf = 0.95
+
+    return round(conf, 2)
+
+
+def build_ai_signal_response(
+    symbol: str,
+    bias: Bias,
+    strategy_code: str,
+    trend_strength: int,
+    near_extreme: bool,
+    params_echo: Optional[Dict[str, Any]] = None,
+) -> OptionSignal:
     strategy = STRATEGY_LIBRARY.get(strategy_code, STRATEGY_LIBRARY["no_trade"])
 
     struct_dict = dict(strategy.get("structure") or {})
@@ -293,7 +343,12 @@ def build_ai_signal_response(symbol: str, bias: Bias, strategy_code: str, params
         notes_val = []
     notes_list = [str(x) for x in notes_val if x is not None]
 
-    confidence = float(strategy.get("confidence", 0.0) or 0.0)
+    confidence = _dynamic_confidence(
+        strategy_code=strategy_code,
+        bias=bias,
+        trend_strength=trend_strength,
+        near_extreme=near_extreme,
+    )
 
     structure = OptionStructure(**struct_dict)
     risk = RiskPlan(**risk_dict)
@@ -322,7 +377,7 @@ def build_ai_signal_response(symbol: str, bias: Bias, strategy_code: str, params
 def generate_ai_signal(
     symbol: str = Query("QQQ", pattern="^(QQQ|SPY|NVDA)$"),
     bias: Bias = Query(Bias.bullish),
-    trend_strength: int = Query(1, ge=1, le=3),
+    trend_strength: int = Query(1, ge=0, le=3),
     near_extreme: bool = Query(False),
     extreme_side: Optional[ExtremeSide] = Query(None),
     prefer_spreads: bool = Query(True),
@@ -346,7 +401,14 @@ def generate_ai_signal(
         "prefer_spreads": prefer_spreads,
     }
 
-    signal = build_ai_signal_response(symbol=sym, bias=bias, strategy_code=strategy_code, params_echo=params_echo)
+    signal = build_ai_signal_response(
+        symbol=sym,
+        bias=bias,
+        strategy_code=strategy_code,
+        trend_strength=trend_strength,
+        near_extreme=near_extreme,
+        params_echo=params_echo,
+    )
 
     # Telegram (opcional: evitar spam en WAIT)
     try:
