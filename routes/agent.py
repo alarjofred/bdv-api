@@ -78,6 +78,20 @@ def _parse_snapshot_time_et(snapshot: Dict[str, Any]) -> Optional[datetime]:
         return None
 
 
+def _now_ny() -> datetime:
+    return datetime.now(tz=ZoneInfo("America/New_York"))
+
+
+def _is_inside_rth(now_ny: datetime) -> Tuple[bool, str]:
+    dow = int(now_ny.strftime("%u"))  # 1..7
+    hhmm = int(now_ny.strftime("%H%M"))
+    if dow >= 6:
+        return False, f"weekend {now_ny.isoformat()}"
+    if hhmm < 930 or hhmm >= 1600:
+        return False, f"outside_rth {now_ny.isoformat()}"
+    return True, f"inside_rth {now_ny.isoformat()}"
+
+
 def _call_openai(prompt: str) -> str:
     if not OPENAI_API_KEY:
         return ""
@@ -200,6 +214,24 @@ def agent_decision(
     - Aplica tu regla por tramos (confidence/trend_strength)
     """
     _require_agent_secret(x_bdv_secret)
+
+    now_ny = _now_ny()
+    inside_rth, rth_reason = _is_inside_rth(now_ny)
+
+    if not inside_rth:
+        return {
+            "status": "ok",
+            "decision": "no_trade",
+            "why": rth_reason,
+            "symbol": None,
+            "side": None,
+            "confidence": 0.0,
+            "expires_in_sec": AGENT_DECISION_TTL_SEC,
+            "snapshot_time_et": None,
+            "sources": {"candidates": [], "skipped_symbols": []},
+            "rule": {"strong": CONF_STRONG, "weak": CONF_WEAK, "weak_trend_min": WEAK_TREND_MIN},
+            "excluded": [],
+        }
 
     if not API_BASE:
         raise HTTPException(status_code=500, detail="RENDER_EXTERNAL_URL no definido")
