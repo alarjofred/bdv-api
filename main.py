@@ -69,9 +69,12 @@ from routes import trade
 from routes import telegram_notify
 from routes import pending_trades
 
-# ✅ snapshot router (para /snapshot/indicators)
+# ✅ routes.snapshot detectado pero desactivado temporalmente
+# para evitar conflicto con /snapshot/indicators definido en este main.py
 try:
-    from routes.snapshot import router as snapshot_router
+    from routes.snapshot import router as _snapshot_router
+    snapshot_router = None
+    print("[INFO] routes.snapshot detectado pero desactivado temporalmente para evitar conflicto con /snapshot/indicators de main.py")
 except Exception as e:
     snapshot_router = None
     print(f"[WARN] No se pudo importar routes.snapshot: {e}")
@@ -148,9 +151,9 @@ app.include_router(trade.router)
 app.include_router(telegram_notify.router)
 app.include_router(pending_trades.router)
 
-# /snapshot/indicators si existe
-if snapshot_router is not None:
-    app.include_router(snapshot_router)
+# routes.snapshot desactivado temporalmente para evitar conflicto
+# if snapshot_router is not None:
+#     app.include_router(snapshot_router)
 
 if analysis is not None:
     app.include_router(analysis.router)
