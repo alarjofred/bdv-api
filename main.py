@@ -247,6 +247,11 @@ except Exception as e:
 if os.path.isdir("ui"):
     app.mount("/ui", StaticFiles(directory="ui", html=True), name="ui")
 
+
+# ---------------------------------
+# Endpoint /snapshot/indicators
+# Bloque 3: salida estandarizada y más útil para agent.py
+# ---------------------------------
 @app.get("/snapshot/indicators")
 def snapshot_indicators(
     symbols: str = "QQQ,SPY,NVDA",
@@ -278,6 +283,7 @@ def snapshot_indicators(
         def _rsi(closes, period=14):
             if len(closes) < period + 1:
                 return 50.0
+
             deltas = np.diff(closes)
             gains = np.where(deltas > 0, deltas, 0.0)
             losses = np.where(deltas < 0, -deltas, 0.0)
@@ -322,68 +328,75 @@ def snapshot_indicators(
             start_intraday = (now - timedelta(hours=max(lookback_hours, 24))).isoformat()
             start_daily = (now - timedelta(days=10)).isoformat()
 
-            bars_5m = _fetch_bars(symbol, timeframe, limit, start_intraday)
+            bars_tf = _fetch_bars(symbol, timeframe, limit, start_intraday)
             bars_1d = _fetch_bars(symbol, "1Day", 5, start_daily)
 
-            if not bars_5m:
+            if not bars_tf:
                 return {
+                    "status": "no_data",
                     "symbol": symbol,
                     "data_quality_ok": False,
                     "bias_inferred": "neutral",
-                    "trend_strength": 1,
+                    "trend_strength": 0,
                     "reason": "no_intraday_bars",
                 }
 
-            closes = np.array([_safe_float(b.get("c")) for b in bars_5m if b.get("c") is not None], dtype=float)
-            highs = np.array([_safe_float(b.get("h")) for b in bars_5m if b.get("h") is not None], dtype=float)
-            lows = np.array([_safe_float(b.get("l")) for b in bars_5m if b.get("l") is not None], dtype=float)
-            volumes = np.array([_safe_float(b.get("v")) for b in bars_5m if b.get("v") is not None], dtype=float)
+            closes = np.array([_safe_float(b.get("c")) for b in bars_tf if b.get("c") is not None], dtype=float)
+            highs = np.array([_safe_float(b.get("h")) for b in bars_tf if b.get("h") is not None], dtype=float)
+            lows = np.array([_safe_float(b.get("l")) for b in bars_tf if b.get("l") is not None], dtype=float)
+            volumes = np.array([_safe_float(b.get("v")) for b in bars_tf if b.get("v") is not None], dtype=float)
 
             if len(closes) < 30 or len(volumes) < 30:
                 return {
+                    "status": "insufficient_data",
                     "symbol": symbol,
                     "data_quality_ok": False,
                     "bias_inferred": "neutral",
-                    "trend_strength": 1,
+                    "trend_strength": 0,
+                    "bars_count": int(len(closes)),
                     "reason": "insufficient_intraday_bars",
-                    "bars_count": len(closes),
                 }
 
             price = float(closes[-1])
-            ema9 = _ema(closes, 9)
-            ema20 = _ema(closes, 20)
-            rsi14 = _rsi(closes, 14)
+            ema_fast = _ema(closes, 9)
+            ema_slow = _ema(closes, 21)
+            rsi_val = _rsi(closes, 14)
 
             vol_base = float(np.mean(volumes[-20:])) if len(volumes) >= 20 else float(np.mean(volumes))
             vol_ratio = float(volumes[-1] / vol_base) if vol_base > 0 else 1.0
 
+            prev_day_close = None
             prev_day_high = None
             prev_day_low = None
-            prev_day_close = None
 
             if len(bars_1d) >= 2:
                 prev = bars_1d[-2]
+                prev_day_close = _safe_float(prev.get("c"), 0.0)
                 prev_day_high = _safe_float(prev.get("h"), 0.0)
                 prev_day_low = _safe_float(prev.get("l"), 0.0)
-                prev_day_close = _safe_float(prev.get("c"), 0.0)
 
             bullish_points = 0
             bearish_points = 0
 
-            if price > ema9 > ema20:
+            if price > ema_fast:
                 bullish_points += 1
-            if price < ema9 < ema20:
+            elif price < ema_fast:
                 bearish_points += 1
 
-            if rsi14 >= 58:
+            if ema_fast > ema_slow:
                 bullish_points += 1
-            if rsi14 <= 42:
+            elif ema_fast < ema_slow:
+                bearish_points += 1
+
+            if rsi_val >= 58:
+                bullish_points += 1
+            elif rsi_val <= 42:
                 bearish_points += 1
 
             if vol_ratio >= 1.15:
-                if closes[-1] >= closes[-2]:
+                if len(closes) >= 2 and closes[-1] > closes[-2]:
                     bullish_points += 1
-                else:
+                elif len(closes) >= 2 and closes[-1] < closes[-2]:
                     bearish_points += 1
 
             if prev_day_close and prev_day_close > 0:
@@ -392,34 +405,41 @@ def snapshot_indicators(
                 elif price < prev_day_close:
                     bearish_points += 1
 
-            if bullish_points >= bearish_points + 1 and bullish_points >= 2:
+            if bullish_points >= 3 and bullish_points >= bearish_points + 1:
                 bias = "bullish"
-                trend_strength = min(3, bullish_points)
-            elif bearish_points >= bullish_points + 1 and bearish_points >= 2:
+                trend_strength = min(3, bullish_points - bearish_points + 1)
+            elif bearish_points >= 3 and bearish_points >= bullish_points + 1:
                 bias = "bearish"
-                trend_strength = min(3, bearish_points)
+                trend_strength = min(3, bearish_points - bullish_points + 1)
+            elif bullish_points > bearish_points:
+                bias = "bullish"
+                trend_strength = 1
+            elif bearish_points > bullish_points:
+                bias = "bearish"
+                trend_strength = 1
             else:
                 bias = "neutral"
-                trend_strength = 1
+                trend_strength = 0
 
             spread_proxy = float(highs[-1] - lows[-1]) if len(highs) and len(lows) else 0.0
-            data_quality_ok = bool(price > 0 and ema9 > 0 and ema20 > 0 and spread_proxy >= 0)
+            data_quality_ok = bool(price > 0 and ema_fast > 0 and ema_slow > 0 and spread_proxy >= 0)
 
             return {
+                "status": "ok",
                 "symbol": symbol,
-                "timeframe": timeframe,
-                "bars_count": len(closes),
                 "data_quality_ok": data_quality_ok,
+                "timeframe": timeframe,
+                "bars_count": int(len(closes)),
+                "price": round(price, 4),
                 "bias_inferred": bias,
                 "trend_strength": int(trend_strength),
-                "price": round(price, 4),
-                "ema9": round(float(ema9), 4),
-                "ema20": round(float(ema20), 4),
-                "rsi14": round(float(rsi14), 2),
+                "ema_fast": round(float(ema_fast), 4),
+                "ema_slow": round(float(ema_slow), 4),
+                "rsi": round(float(rsi_val), 2),
                 "vol_ratio": round(float(vol_ratio), 2),
+                "prev_day_close": round(float(prev_day_close), 4) if prev_day_close else None,
                 "prev_day_high": round(float(prev_day_high), 4) if prev_day_high else None,
                 "prev_day_low": round(float(prev_day_low), 4) if prev_day_low else None,
-                "prev_day_close": round(float(prev_day_close), 4) if prev_day_close else None,
                 "price_vs_prev_close": round(float(price - prev_day_close), 4) if prev_day_close else None,
             }
 
@@ -430,23 +450,30 @@ def snapshot_indicators(
                 syms.append(s)
 
         data = {}
-        errors = {}
-
         for sym in syms:
             try:
                 data[sym] = _build_symbol_context(sym)
             except Exception as e:
-                errors[sym] = str(e)
+                data[sym] = {
+                    "status": "error",
+                    "symbol": sym,
+                    "data_quality_ok": False,
+                    "bias_inferred": "neutral",
+                    "trend_strength": 0,
+                    "reason": str(e),
+                }
 
         return {
             "status": "ok",
             "data": data,
-            "errors": errors,
             "meta": {
                 "timeframe": timeframe,
                 "limit": limit,
                 "lookback_hours": lookback_hours,
                 "feed": os.getenv("APCA_DATA_FEED", "iex"),
+                "ema_fast_period": 9,
+                "ema_slow_period": 21,
+                "rsi_period": 14,
             },
         }
 
