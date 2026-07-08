@@ -313,7 +313,7 @@ def agent_decision(
 
     # elegir mejor buy/sell por confidence
       # elegir mejor buy/sell por confidence
-    best = None
+       best = None
 
     for c in candidates:
         action = str(c.get("action", "")).strip().lower()
@@ -321,7 +321,6 @@ def agent_decision(
         conf_c = float(c.get("confidence", 0) or 0)
         ts_c = int(c.get("trend_strength", 1) or 1)
 
-        # Estrategia V2: convertir señales fuertes en acción operable
         if action not in ("buy", "sell"):
             if conf_c >= CONF_STRONG and ts_c >= WEAK_TREND_MIN:
                 if bias_c == "bullish":
@@ -336,6 +335,8 @@ def agent_decision(
 
         if best is None or float(c.get("confidence", 0) or 0) > float(best.get("confidence", 0) or 0):
             best = c
+
+    if not best:
         return {
             "status": "ok",
             "decision": "no_trade",
