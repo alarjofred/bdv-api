@@ -312,27 +312,10 @@ def agent_decision(
         candidates.append(_summarize_candidate(sym, ctx, ai_payload))
 
     # elegir mejor buy/sell por confidence
-      # elegir mejor buy/sell por confidence
-       best = None
-
+    best = None
     for c in candidates:
-        action = str(c.get("action", "")).strip().lower()
-        bias_c = str(c.get("bias", "")).strip().lower()
-        conf_c = float(c.get("confidence", 0) or 0)
-        ts_c = int(c.get("trend_strength", 1) or 1)
-
-        if action not in ("buy", "sell"):
-            if conf_c >= CONF_STRONG and ts_c >= WEAK_TREND_MIN:
-                if bias_c == "bullish":
-                    c["action"] = "buy"
-                    action = "buy"
-                elif bias_c == "bearish":
-                    c["action"] = "sell"
-                    action = "sell"
-
-        if action not in ("buy", "sell"):
+        if c.get("action") not in ("buy", "sell"):
             continue
-
         if best is None or float(c.get("confidence", 0) or 0) > float(best.get("confidence", 0) or 0):
             best = c
 
