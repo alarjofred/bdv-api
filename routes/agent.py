@@ -304,6 +304,7 @@ def agent_decision(
         return _base_no_trade_response("AGENT_DECISION_ENABLED=false")
 
     excluded_symbols = set()
+
     if exclude_symbols:
         for raw_symbol in str(exclude_symbols).split(","):
             symbol = raw_symbol.strip().upper()
@@ -328,6 +329,7 @@ def agent_decision(
         return response
 
     snapshot = _get_json(f"{API_BASE}/snapshot", timeout=8)
+
     snapshot_time_et = _parse_snapshot_time_et(
         snapshot if isinstance(snapshot, dict) else {}
     )
@@ -361,6 +363,7 @@ def agent_decision(
         ctx = market_ctx.get(symbol, {}) if isinstance(market_ctx, dict) else {}
 
         status_ctx = str(ctx.get("status", "ok")).strip().lower()
+
         if status_ctx not in ("ok", ""):
             skipped_symbols.append(
                 {
@@ -382,10 +385,12 @@ def agent_decision(
             continue
 
         bias = str(ctx.get("bias_inferred", "neutral")).strip().lower()
+
         if bias not in ("bullish", "bearish", "neutral"):
             bias = "neutral"
 
         trend_strength = _safe_int(ctx.get("trend_strength", 1), 1)
+
         if trend_strength < 1:
             trend_strength = 1
 
@@ -415,6 +420,7 @@ def agent_decision(
             continue
 
         best_confidence = _safe_float(best.get("confidence", 0), 0.0)
+
         if confidence > best_confidence:
             best = candidate
 
@@ -442,6 +448,7 @@ def agent_decision(
 
     confidence = _safe_float(best.get("confidence", 0), 0.0)
     trend_strength = _safe_int(best.get("trend_strength", 1), 1)
+
     allow, rule_why = _rule_allows_trade(confidence, trend_strength)
 
     return {
@@ -495,6 +502,7 @@ def agent_scan(
     )
 
     title = "TRADE" if decision.get("decision") == "trade" else "NO TRADE"
+
     _send_signal_telegram(symbols, title, note)
 
     return {
