@@ -15,6 +15,7 @@ API_BASE = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 BDV_AGENT_SECRET = os.getenv("BDV_AGENT_SECRET", "").strip()
 
 AGENT_SYMBOLS = os.getenv("AGENT_SYMBOLS", "QQQ,SPY,NVDA")
+
 AGENT_SEND_TELEGRAM = os.getenv("AGENT_SEND_TELEGRAM", "1").strip().lower() not in (
     "0",
     "false",
@@ -70,12 +71,19 @@ def _api_headers() -> Dict[str, str]:
 
 
 def _get_json(url: str, timeout: int = 10) -> Dict[str, Any]:
-    response = requests.get(url, headers=_api_headers(), timeout=timeout)
+    response = requests.get(
+        url,
+        headers=_api_headers(),
+        timeout=timeout,
+    )
     response.raise_for_status()
 
     payload = response.json()
+
     if isinstance(payload, dict):
-        return payload.get("data", payload)
+        data = payload.get("data", payload)
+        if isinstance(data, dict):
+            return data
 
     return {}
 
@@ -178,6 +186,7 @@ def _get_signals_ai(symbol: str, bias: str, trend_strength: int) -> Dict[str, An
         }
 
     payload = response.json()
+
     if isinstance(payload, dict):
         return payload
 
@@ -221,12 +230,14 @@ def _normalize_candidate_action(candidate: Dict[str, Any]) -> Dict[str, Any]:
     confidence = _safe_float(candidate.get("confidence", 0), 0.0)
     trend_strength = _safe_int(candidate.get("trend_strength", 1), 1)
 
-    if action not in ("buy", "sell"):
-        if confidence >= CONF_STRONG and trend_strength >= WEAK_TREND_MIN:
-            if bias == "bullish":
-                candidate["action"] = "buy"
-            elif bias == "bearish":
-                candidate["action"] = "sell"
+    if action in ("buy", "sell"):
+        return candidate
+
+    if confidence >= CONF_STRONG and trend_strength >= WEAK_TREND_MIN:
+        if bias == "bullish":
+            candidate["action"] = "buy"
+        elif bias == "bearish":
+            candidate["action"] = "sell"
 
     return candidate
 
@@ -237,27 +248,21 @@ def _rule_allows_trade(confidence: float, trend_strength: int) -> Tuple[bool, st
 
     if CONF_WEAK <= confidence < CONF_STRONG:
         if trend_strength >= WEAK_TREND_MIN:
-            return True, f"weak_conf>=({CONF_WEAK}) and trend_strength>=({WEAK_TREND_MIN})"
+            return True, (
+                f"weak_conf>=({CONF_WEAK}) "
+                f"and trend_strength>=({WEAK_TREND_MIN})"
+            )
 
         return False, f"weak_conf but trend_strength<{WEAK_TREND_MIN}"
 
     return False, f"confidence<{CONF_WEAK}"
 
 
-@router.get("/decision")
-def agent_decision(
-    x_bdv_secret: Optional[str] = Header(default=None),
-    exclude_symbols: Optional[str] = Query(default=None),
-):
-    _require_agent_secret(x_bdv_secret)
-
-    now_ny = _now_ny()
-    inside_rth, rth_reason = _is_inside_rth(now_ny)
-
-    base_response = {
+def _base_no_trade_response(reason: str) -> Dict[str, Any]:
+    return {
         "status": "ok",
         "decision": "no_trade",
-        "why": rth_reason,
+        "why": reason,
         "symbol": None,
         "side": None,
         "confidence": 0.0,
@@ -275,8 +280,19 @@ def agent_decision(
         "excluded": [],
     }
 
+
+@router.get("/decision")
+def agent_decision(
+    x_bdv_secret: Optional[str] = Header(default=None),
+    exclude_symbols: Optional[str] = Query(default=None),
+):
+    _require_agent_secret(x_bdv_secret)
+
+    now_ny = _now_ny()
+    inside_rth, rth_reason = _is_inside_rth(now_ny)
+
     if not inside_rth:
-        return base_response
+        return _base_no_trade_response(rth_reason)
 
     if not API_BASE:
         raise HTTPException(
@@ -285,8 +301,7 @@ def agent_decision(
         )
 
     if not AGENT_DECISION_ENABLED:
-        base_response["why"] = "AGENT_DECISION_ENABLED=false"
-        return base_response
+        return _base_no_trade_response("AGENT_DECISION_ENABLED=false")
 
     excluded_symbols = set()
     if exclude_symbols:
@@ -308,9 +323,9 @@ def agent_decision(
     ]
 
     if not symbols:
-        base_response["why"] = "all_symbols_excluded"
-        base_response["excluded"] = sorted(list(excluded_symbols))
-        return base_response
+        response = _base_no_trade_response("all_symbols_excluded")
+        response["excluded"] = sorted(list(excluded_symbols))
+        return response
 
     snapshot = _get_json(f"{API_BASE}/snapshot", timeout=8)
     snapshot_time_et = _parse_snapshot_time_et(
@@ -381,12 +396,13 @@ def agent_decision(
         )
 
         candidate = _summarize_candidate(symbol, ctx, ai_payload)
+        candidate = _normalize_candidate_action(candidate)
+
         candidates.append(candidate)
 
     best: Optional[Dict[str, Any]] = None
 
     for candidate in candidates:
-        candidate = _normalize_candidate_action(candidate)
         action = str(candidate.get("action", "")).strip().lower()
 
         if action not in ("buy", "sell"):
@@ -432,8 +448,8 @@ def agent_decision(
         "status": "ok",
         "decision": "trade" if allow else "no_trade",
         "why": f"signals_ai_best_candidate | {rule_why}",
-        "symbol": best["symbol"],
-        "side": best["action"],
+        "symbol": best.get("symbol"),
+        "side": best.get("action"),
         "confidence": confidence,
         "expires_in_sec": AGENT_DECISION_TTL_SEC,
         "snapshot_time_et": snapshot_time_et,
