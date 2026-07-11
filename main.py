@@ -63,7 +63,8 @@ from routes.config import router as config_router
 from routes.monitor import router as monitor_router
 from routes.signals_ai import router as signals_ai_router
 from routes.alpaca_close import router as alpaca_close_router
-from routes.agent import router as agent_router
+# TEMPORAL: agent desactivado para diagnosticar consumo de memoria
+# from routes.agent import router as agent_router
 
 from routes import trade
 from routes import telegram_notify
@@ -143,7 +144,8 @@ app.include_router(signals_router)
 app.include_router(config_router)
 app.include_router(monitor_router)
 app.include_router(signals_ai_router)
-app.include_router(alpaca_close_router)
+# TEMPORAL: agent desactivado para diagnosticar consumo de memoria
+# app.include_router(agent_router)
 app.include_router(agent_router)
 
 # /trade SOLO desde routes/trade.py
