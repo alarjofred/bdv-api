@@ -146,7 +146,7 @@ app.include_router(monitor_router)
 app.include_router(signals_ai_router)
 # TEMPORAL: agent desactivado para diagnosticar consumo de memoria
 # app.include_router(agent_router)
-app.include_router(agent_router)
+
 
 # /trade SOLO desde routes/trade.py
 app.include_router(trade.router)
